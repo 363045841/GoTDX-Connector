@@ -20,14 +20,14 @@ func writeV1BarsError(c *gin.Context, err error) {
 	writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
 }
 
-// v1BarRequest V1 K 线请求；before 为可选 UTC Unix 毫秒排他游标。
+// v1BarRequest V1 K 线请求；beforeTimestamp 为可选 UTC Unix 毫秒排他游标。
 type v1BarRequest struct {
-	SourceID   string                `json:"sourceId"`
-	Instrument v1InstrumentReference `json:"instrument"`
-	Period     string                `json:"period"`
-	Adjustment string                `json:"adjustment"`
-	Limit      int                   `json:"limit"`
-	Before     *int64                `json:"before,omitempty"`
+	SourceID        string                `json:"sourceId"`
+	Instrument      v1InstrumentReference `json:"instrument"`
+	Period          string                `json:"period"`
+	Adjustment      string                `json:"adjustment"`
+	Limit           int                   `json:"limit"`
+	BeforeTimestamp *int64                `json:"beforeTimestamp,omitempty"`
 }
 
 // v1BarSeries V1 K 线序列。
@@ -66,8 +66,8 @@ func handleV1Bars(c *gin.Context) {
 	}
 	timezone := v1ExchangeToTimezone(req.Instrument.Exchange)
 	var before *time.Time
-	if req.Before != nil {
-		cursor := time.UnixMilli(*req.Before).UTC()
+	if req.BeforeTimestamp != nil {
+		cursor := time.UnixMilli(*req.BeforeTimestamp).UTC()
 		before = &cursor
 	}
 	ref := req.Instrument.ProviderRef
@@ -95,7 +95,7 @@ func handleV1Bars(c *gin.Context) {
 		}
 		bars, err := domain.IndexKLineBefore(category, uint8(market), req.Instrument.Symbol, req.Limit, before)
 		if err != nil {
-			if req.Before != nil && errors.Is(err, domain.ErrNoKLineData) {
+			if req.BeforeTimestamp != nil && errors.Is(err, domain.ErrNoKLineData) {
 				break
 			}
 			writeV1BarsError(c, err)
@@ -112,7 +112,7 @@ func handleV1Bars(c *gin.Context) {
 		}
 		bars, err := domain.ExKLineBefore(uint8(cat), req.Instrument.Symbol, category, 1, req.Limit, before)
 		if err != nil {
-			if req.Before != nil && errors.Is(err, domain.ErrNoKLineData) {
+			if req.BeforeTimestamp != nil && errors.Is(err, domain.ErrNoKLineData) {
 				break
 			}
 			writeV1BarsError(c, err)
@@ -129,7 +129,7 @@ func handleV1Bars(c *gin.Context) {
 		}
 		bars, err := domain.StockKLineBefore(category, uint8(market), req.Instrument.Symbol, 1, adjust, req.Limit, before)
 		if err != nil {
-			if req.Before != nil && errors.Is(err, domain.ErrNoKLineData) {
+			if req.BeforeTimestamp != nil && errors.Is(err, domain.ErrNoKLineData) {
 				break
 			}
 			writeV1BarsError(c, err)

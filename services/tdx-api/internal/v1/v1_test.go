@@ -280,7 +280,7 @@ func TestV1BarsStockBeforeCursor(t *testing.T) {
 
 	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
-		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none","limit":2,"before":`+strconv.FormatInt(cursor.UnixMilli(), 10)+`}`)
+		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none","limit":2,"beforeTimestamp":`+strconv.FormatInt(cursor.UnixMilli(), 10)+`}`)
 
 	var body struct {
 		Data struct {
@@ -404,7 +404,7 @@ func TestV1BarsCursorExhaustedReturnsSuccess(t *testing.T) {
 
 	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
-		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none","limit":1,"before":1}`)
+		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none","limit":1,"beforeTimestamp":1}`)
 
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200: %s", resp.Code, resp.Body.String())
