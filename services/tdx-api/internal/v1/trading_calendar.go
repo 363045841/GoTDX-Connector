@@ -35,21 +35,51 @@ type v1TradingCalendarResult struct {
 	FutureTimestamps []int64 `json:"futureTimestamps"`
 }
 
+// futuresCalendarVenue 是日历数据库覆盖的一个期货交易所及其商品代码前缀表。
+type futuresCalendarVenue struct {
+	venue string
+	// codes 为空格分隔的品种代码前缀，首尾各留一个空格，
+	// 使匹配时 " "+prefix+" " 只能命中完整前缀，避免 "I" 误配 "IC"。
+	codes string
+}
+
+// futuresCalendarVenues 覆盖数据库 exchange 列出现的全部期货交易所：
+//
+//	SHFE  上海期货交易所：AL 铝、AO 氧化铝、AU 黄金、AG 白银、ZN 锌、CU 铜、NI 沪镍、
+//	      PB 沪铅、SN 沪锡、RB 螺纹钢、WR 线材、SS 不锈钢、HC 热卷、FU 燃油、
+//	      BU 沥青、RU 橡胶、SP 纸浆、BR 原油。
+//	INE   上海国际能源交易中心：SC 原油、BC 国际航线船用燃料油、LU 液化天然气、
+//	      EC 集运指数（欧线）、NR 纯苯。
+//	DCE   大连商品交易所：I 铁矿石、J 焦炭、JM 焦煤、M 豆粕、Y 豆油、P 棕榈油、
+//	      L 塑料、PP 聚丙烯、V PVC、EG 乙二醇、EB 苯乙烯、FB 纤维板、PG 液化石油气、
+//	      A 豆一、B 豆二、C 玉米、CS 玉米淀粉、JD 鸡蛋、RR 粳米。
+//	CZCE  郑州商品交易所：CF 棉花、CY 棉纱、SR 白糖、OI 菜油、RM 菜粕、RS 菜籽、
+//	      AP 苹果、CJ 红枣、FG 玻璃、SA 纯碱、MA 甲醇、TA PTA、PF 短纤、PK 花生、
+//	      PM 普麦、WH 强麦、JR 粳稻、UR 尿素、PR 瓶片、SF 硅铁、SM 锰硅、ZC 动力煤。
+//	CFFEX 中国金融期货交易所：IF/IC/IH/IM 股指、TF/T/TL/TS 国债。
+//
+// 顺序固定：契约代码由交易所唯一决定，但显式按切片而非 map 迭代，
+// 避免未来新增品种前缀冲突时匹配结果随 map 遍历顺序漂移。
+var futuresCalendarVenues = []futuresCalendarVenue{
+	{venue: "SHFE", codes: " AL AO AG AU BR BU CU FU HC NI PB RB RU SN SP SS WR ZN "},
+	{venue: "INE", codes: " BC EC LU NR SC "},
+	{venue: "DCE", codes: " A B C CS EB EG FB I J JD JM L LH M P PG PP RR V Y "},
+	{venue: "CZCE", codes: " AP CF CJ CY FG JR MA OI PF PK PM PR RM RS SA SF SM SR TA UR WH ZC "},
+	{venue: "CFFEX", codes: " IC IF IH IM T TF TL TS "},
+}
+
 // futuresCalendarExchange 仅识别数据库覆盖的中国期货交易所及对应合约前缀。
+// 交易所以外的上市场所（如 "SH"、"HK"）或无法归类的代码一律返回 false，
+// 调用方据此关闭该序列的交易日历能力，而非退化为工作日推测。
 func futuresCalendarExchange(exchange, symbol string) (string, bool) {
 	if strings.ToUpper(exchange) != "FUTURES" {
 		return "", false
 	}
 	prefix := strings.TrimRightFunc(strings.ToUpper(strings.TrimSpace(symbol)), unicode.IsDigit)
-	for venue, codes := range map[string]string{
-		"SHFE":  " AL AO AG AU BR BU CU FU HC NI PB RB RU SN SP SS WR ZN ",
-		"INE":   " BC EC LU NR SC ",
-		"DCE":   " A B C CS EB EG FB I J JD JM L LH M P PG PP RR V Y ",
-		"CZCE":  " AP CF CJ CY FG JR MA OI PF PK PM PR RM RS SA SF SM SR TA UR WH ZC ",
-		"CFFEX": " IC IF IH IM T TF TL TS ",
-	} {
-		if strings.Contains(codes, " "+prefix+" ") {
-			return venue, true
+	// 纯数字代码去掉后为空，与任何 codes 都不匹配，自然被排除。
+	for _, entry := range futuresCalendarVenues {
+		if strings.Contains(entry.codes, " "+prefix+" ") {
+			return entry.venue, true
 		}
 	}
 	return "", false

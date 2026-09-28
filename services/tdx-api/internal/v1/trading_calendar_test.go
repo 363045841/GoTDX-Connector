@@ -4,6 +4,7 @@ package v1
 import (
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,5 +60,52 @@ func TestTradingCalendarCapabilities(t *testing.T) {
 	}
 	if _, ok := futuresCalendarExchange("FUTURES", "UNKNOWN2610"); ok {
 		t.Fatal("unknown futures must not be advertised")
+	}
+}
+
+// TestFuturesCalendarVenues 校验前缀表与注释一致：格式合法、逐个前缀可命中、互不串所。
+func TestFuturesCalendarVenues(t *testing.T) {
+	wantVenues := map[string]bool{"SHFE": true, "INE": true, "DCE": true, "CZCE": true, "CFFEX": true}
+	seen := map[string]int{}
+	for _, entry := range futuresCalendarVenues {
+		if !wantVenues[entry.venue] {
+			t.Fatalf("unexpected venue %q; 数据库 exchange 列仅含 %v", entry.venue, wantVenues)
+		}
+		if !strings.HasPrefix(entry.codes, " ") || !strings.HasSuffix(entry.codes, " ") {
+			t.Fatalf("%s codes must be space padded: %q", entry.venue, entry.codes)
+		}
+		if strings.Contains(entry.codes, "  ") {
+			t.Fatalf("%s codes must not contain empty prefix: %q", entry.venue, entry.codes)
+		}
+		for _, prefix := range strings.Fields(entry.codes) {
+			seen[prefix]++
+			venue, ok := futuresCalendarExchange("FUTURES", prefix+"2610")
+			if !ok || venue != entry.venue {
+				t.Fatalf("prefix %q resolved to %q/%v, want %q", prefix, venue, ok, entry.venue)
+			}
+		}
+	}
+	if len(seen) == 0 {
+		t.Fatal("venue table is empty")
+	}
+}
+
+// TestFuturesCalendarPrefixIsolation 验证短前缀不会误配其他交易所的更长品种代码。
+func TestFuturesCalendarPrefixIsolation(t *testing.T) {
+	cases := map[string]string{
+		"I2610":  "DCE",   // 铁矿石，不能命中 CFFEX 的 IC/IF/IH/IM
+		"IC2610": "CFFEX", // 沪深 300 股指
+		"L2610":  "DCE",   // 塑料，不能命中 INE 的 LU
+		"LU2610": "INE",   // 液化天然气
+		"P2610":  "DCE",   // 棕榈油，不能命中 CZCE 的 PF/PK/PM 或 DCE 自身的 PG/PP
+		"TA2610": "CZCE",  // PTA
+		"T2610":  "CFFEX", // 10 年期国债，不能命中 CZCE 的 TA
+		"2601":   "",      // 纯数字无品种前缀
+	}
+	for symbol, want := range cases {
+		venue, _ := futuresCalendarExchange("FUTURES", symbol)
+		if venue != want {
+			t.Fatalf("%s resolved to %q, want %q", symbol, venue, want)
+		}
 	}
 }
