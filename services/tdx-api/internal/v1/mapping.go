@@ -41,10 +41,11 @@ type v1BarCapability struct {
 
 // v1InstrumentCapabilities V1 品种可启用的行情能力。
 type v1InstrumentCapabilities struct {
-	Bars           *v1BarCapability            `json:"bars,omitempty"`
-	TimeShare      *bool                       `json:"timeShare,omitempty"`
-	TimeShareRange *v1TimeShareRangeCapability `json:"timeShareRange,omitempty"`
-	Depth          *bool                       `json:"depth,omitempty"`
+	Bars            *v1BarCapability            `json:"bars,omitempty"`
+	TradingCalendar *bool                       `json:"tradingCalendar,omitempty"`
+	TimeShare       *bool                       `json:"timeShare,omitempty"`
+	TimeShareRange  *v1TimeShareRangeCapability `json:"timeShareRange,omitempty"`
+	Depth           *bool                       `json:"depth,omitempty"`
 }
 
 // v1TimeShareRangeCapability 声明多日分时接口可一次查询的交易日上限。
@@ -60,6 +61,7 @@ type v1HistoryCoverage struct {
 
 // v1SourceCapabilities V1 源级能力声明，前端流转层据此筛选候选源。
 type v1SourceCapabilities struct {
+	TradingCalendar bool                        `json:"tradingCalendar"`
 	AssetClasses    []string                    `json:"assetClasses"`
 	Bars            *v1BarCapability            `json:"bars,omitempty"`
 	TimeShare       *bool                       `json:"timeShare,omitempty"`
@@ -76,7 +78,8 @@ func v1SourceCapabilitiesFor() v1SourceCapabilities {
 	timeShare, depth := true, false
 	now := time.Now().UnixMilli()
 	return v1SourceCapabilities{
-		AssetClasses: []string{"stock", "index", "fund", "future", "option", "forex"},
+		TradingCalendar: true,
+		AssetClasses:    []string{"stock", "index", "fund", "future", "option", "forex"},
 		Bars: &v1BarCapability{
 			Periods:     append([]string(nil), v1KLinePeriods...),
 			Adjustments: []string{"qfq", "hfq", "none"},
@@ -247,6 +250,10 @@ func toV1Instrument(item directory.Item) v1InstrumentDescriptor {
 	}
 	assetClass := v1AssetClass(item.Exchange, kind)
 	caps := v1InstrumentCapabilitiesFor(kind)
+	if _, ok := futuresCalendarExchange(item.Exchange, item.Symbol); ok {
+		supported := true
+		caps.TradingCalendar = &supported
+	}
 	return v1InstrumentDescriptor{
 		ID:           v1InstrumentID(kind, key, item.Symbol),
 		SourceID:     v1SourceID,
