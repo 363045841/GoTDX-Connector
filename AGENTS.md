@@ -36,6 +36,7 @@ BaoStock lives in a **separate** repo (`stockbao`, port 8000). Do not add it her
 - binance-api defaults proxy to `http://127.0.0.1:6666` if `HTTP_PROXY` unset.
 - CORS wide-open on both services.
 - Binance routes are `/api/binance/*` (not the old misspelled `/api/biance/*`).
+- Live bars: `GET /api/v1/market-data/sources/gotdx/stream` (SSE, KCQ `BarsLiveSource` frames); main-market A-shares/indices only.
 - tdx-api 只有 V1 行情协议 + 健康检查，旧 `/api/stock|ex|mac|hosts` 接口已删除。
 
 ## Env vars
@@ -49,6 +50,9 @@ BaoStock lives in a **separate** repo (`stockbao`, port 8000). Do not add it her
 | `GOTDX_MAIN_HOSTS` | built-in | comma-separated |
 | `GOTDX_EX_HOSTS` | built-in | comma-separated |
 | `GOTDX_MAC_HOSTS` | built-in | comma-separated |
+| `GOTDX_LIVE_POLL_INTERVAL` | `2s` | live-bars poll interval during CN trading hours (min 500ms) |
+| `GOTDX_LIVE_MAX_STREAMS` | `256` | max concurrent live-bars SSE connections |
+| `GOTDX_LIVE_MAX_SERIES` | `32` | max distinct (instrument, period, adjust) pollers |
 
 ### binance-api
 | Var | Default | Note |
@@ -67,7 +71,8 @@ services/
     internal/client/     — gotdx singleton (probe, connect, reconnect, heartbeat)
     internal/directory/  — 证券目录：加载/缓存/SQLite 持久化/搜索
     internal/domain/     — 领域层：K线分页、分时构建、昨收解析、kind 路由
-    internal/v1/         — V1 行情协议：envelope、探测、搜索、bars/timeshare
+    internal/live/       — 实时 K 线轮询中枢（每序列一个上游轮询器，差分后扇出）
+    internal/v1/         — V1 行情协议：envelope、探测、搜索、bars/timeshare、stream SSE
     internal/server/     — HTTP 装配：健康检查 + 目录缓存 + V1 路由
   binance-api/
     main.go
