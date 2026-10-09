@@ -4,15 +4,14 @@
   关闭 KlineChartQuantGo 历史进程（按端口 / 进程名）。
 
 .EXAMPLE
-  .\scripts\stop-services.ps1           # tdx + binance
+  .\scripts\stop-services.ps1           # tdx
   .\scripts\stop-services.ps1 tdx       # 仅 8080 / tdx
-  .\scripts\stop-services.ps1 binance   # 仅 8081 / binance
   .\scripts\stop-services.ps1 -Force    # 不询问
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
   [Parameter(Position = 0)]
-  [ValidateSet('all', 'tdx', 'binance')]
+  [ValidateSet('all', 'tdx')]
   [string]$Service = 'all',
 
   [switch]$Force
@@ -20,17 +19,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 
-$targets = switch ($Service) {
-  'tdx' {
-    @{ Ports = @(8080); Names = @('tdx-api', 'KlineChartQuantGo') }
-  }
-  'binance' {
-    @{ Ports = @(8081); Names = @('binance-api', 'KlineChartQuantGo') }
-  }
-  default {
-    @{ Ports = @(8080, 8081); Names = @('tdx-api', 'binance-api', 'KlineChartQuantGo') }
-  }
-}
+$targets = @{ Ports = @(8080); Names = @('tdx-api', 'KlineChartQuantGo') }
 
 function Get-PortOwners {
   param([int[]]$Ports)
@@ -56,7 +45,6 @@ function Get-NamedOwners {
       if ($name -eq 'KlineChartQuantGo') {
         $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($_.Id)" -ErrorAction SilentlyContinue).CommandLine
         if ($Service -eq 'tdx' -and $cmd -notmatch '\b(tdx|tdx-api|gotdx)\b') { continue }
-        if ($Service -eq 'binance' -and $cmd -notmatch '\b(binance|binance-api)\b') { continue }
       }
       $ids.Add([int]$_.Id)
     }

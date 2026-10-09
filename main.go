@@ -17,8 +17,6 @@ func main() {
 	switch os.Args[1] {
 	case "tdx", "tdx-api", "gotdx":
 		target = "./services/tdx-api"
-	case "binance", "binance-api":
-		target = "./services/binance-api"
 	case "help", "-h", "--help":
 		printUsage()
 		return
@@ -54,12 +52,9 @@ Usage:
 
 Services:
   tdx, tdx-api, gotdx     Start TDX/gotdx API (port 8080)
-  binance, binance-api    Start Binance API (port 8081)
 
 Examples:
   go run . tdx
-  go run . binance
   go run ./services/tdx-api
-  go run ./services/binance-api
 `, exe)
 }
