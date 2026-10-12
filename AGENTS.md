@@ -1,6 +1,6 @@
 # KlineChartQuantGo — Agent Guide
 
-单一 Go module（`KlineChartQuantGo`），两个可执行服务共用依赖，目录按服务拆分。
+单一 Go module（`KlineChartQuantGo`），单个可执行服务（tdx-api），目录按服务拆分。
 
 ## Quick start
 
@@ -10,32 +10,25 @@
 # 通达信（默认 8080）
 go run . tdx
 # 或: go run ./services/tdx-api
-
-# 币安（默认 8081）
-go run . binance
-# 或: go run ./services/binance-api
 ```
 
-根目录 `main.go` 是启动器，必须带服务名：`go run . tdx` / `go run . binance`。
+根目录 `main.go` 是启动器，必须带服务名：`go run . tdx`。
 
 ## Services
 
 | Service | Path | Port | Role |
 |---|---|---|---|
 | tdx-api | `./services/tdx-api` | `8080` | gotdx V1 market-data API（A股/指数/扩展行情） |
-| binance-api | `./services/binance-api` | `8081` | Binance orderbook + depth SSE |
 
-BaoStock lives in a **separate** repo (`stockbao`, port 8000). Do not add it here.
+BaoStock lives in a **separate** repo (`stockbao`, port 8000); Binance lives in `Binance-Connector`. Do not add them here.
 
 ## Key facts
 
 - **One module**: root `go.mod` → `module KlineChartQuantGo`. No nested `go.mod` under services.
 - **Go 1.27**, Gin framework, SQLite symbol directory persistence with startup warm-up, per-package tests, no CI.
-- Import paths: `KlineChartQuantGo/services/tdx-api/internal/...` and `KlineChartQuantGo/services/binance-api/internal/...`
+- Import paths: `KlineChartQuantGo/services/tdx-api/internal/...`
 - tdx-api client singleton via `client.DefaultManager()` — probes gotdx hosts at startup.
-- binance-api defaults proxy to `http://127.0.0.1:6666` if `HTTP_PROXY` unset.
-- CORS wide-open on both services.
-- Binance routes are `/api/binance/*` (not the old misspelled `/api/biance/*`).
+- CORS wide-open.
 - tdx-api 只有 V1 行情协议 + 健康检查，旧 `/api/stock|ex|mac|hosts` 接口已删除。
 
 ## Env vars
@@ -50,17 +43,10 @@ BaoStock lives in a **separate** repo (`stockbao`, port 8000). Do not add it her
 | `GOTDX_EX_HOSTS` | built-in | comma-separated |
 | `GOTDX_MAC_HOSTS` | built-in | comma-separated |
 
-### binance-api
-| Var | Default | Note |
-|---|---|---|
-| `PORT` | `8081` | |
-| `SYMBOLS` | `btcusdt,ethusdt` | comma-separated |
-| `HTTP_PROXY` / `HTTPS_PROXY` | `http://127.0.0.1:6666` | |
-
 ## Structure
 ```
 go.mod                 — module KlineChartQuantGo
-main.go                — launcher: go run . <tdx|binance>
+main.go                — launcher: go run . tdx
 services/
   tdx-api/
     main.go
@@ -69,10 +55,6 @@ services/
     internal/domain/     — 领域层：K线分页、分时构建、昨收解析、kind 路由
     internal/v1/         — V1 行情协议：envelope、探测、搜索、bars/timeshare
     internal/server/     — HTTP 装配：健康检查 + 目录缓存 + V1 路由
-  binance-api/
-    main.go
-    internal/binance/  — WS client + DepthHub
-    internal/handler/  — Gin router (orderbook + SSE)
 ```
 
 ## Conventions
