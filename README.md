@@ -71,6 +71,7 @@ go build -o tdx-api.exe ./services/tdx-api
 ├── main.go                      # 启动器: go run . tdx
 ├── README.md
 ├── AGENTS.md
+├── LICENSE
 └── services/
     └── tdx-api/                 # 通达信行情代理
         ├── main.go
@@ -87,3 +88,7 @@ go build -o tdx-api.exe ./services/tdx-api
 - **Go 1.27** + Gin
 - **gotdx** — 通达信协议 Go 实现（tdx-api）
 - **modernc.org/sqlite** — 证券目录本地快照（纯内存代理，实时转发）
+
+## 许可证
+
+本项目采用 [Apache License 2.0](LICENSE) 开源。
