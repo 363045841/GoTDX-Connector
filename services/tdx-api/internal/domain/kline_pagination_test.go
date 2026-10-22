@@ -268,6 +268,59 @@ func TestStockKLineBeforeUsesExclusiveCursorAndAscendingOrder(t *testing.T) {
 	}
 }
 
+// 验证深层 cursor 的扫描页大小独立于返回条数，避免小尾页逐根扫描全部历史。
+func TestStockKLineBeforeScansCursorUsingFullUpstreamPages(t *testing.T) {
+	prev := FetchStockKLinePage
+	t.Cleanup(func() { FetchStockKLinePage = prev })
+	base := time.Date(2020, 1, 1, 15, 0, 0, 0, time.Local)
+	dataset := make([]proto.SecurityBar, 2*int(klinePageSize)+10)
+	for i := range dataset {
+		dataset[i] = proto.SecurityBar{DateTime: base.AddDate(0, 0, i)}
+	}
+	cursor := dataset[100].DateTime
+	for _, tc := range []struct {
+		name      string
+		before    *time.Time
+		limit     int
+		wantCalls int
+		wantCount uint16
+		end       int
+	}{
+		{name: "recent single bar", limit: 1, wantCalls: 1, wantCount: 1, end: len(dataset)},
+		{name: "deep single bar", before: &cursor, limit: 1, wantCalls: 2, wantCount: klinePageSize, end: 100},
+		{name: "deep partial page", before: &cursor, limit: 17, wantCalls: 2, wantCount: klinePageSize, end: 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var counts []uint16
+			FetchStockKLinePage = func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
+				counts = append(counts, count)
+				end := len(dataset) - int(start)
+				if end <= 0 {
+					return nil, nil
+				}
+				begin := max(0, end-int(count))
+				return dataset[begin:end], nil
+			}
+			got, err := StockKLineBefore(4, 1, "600000", 1, 0, tc.limit, tc.before)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(counts) != tc.wantCalls || counts[0] != tc.wantCount {
+				t.Fatalf("scan calls = %d, first count = %d; want %d calls of %d", len(counts), counts[0], tc.wantCalls, tc.wantCount)
+			}
+			if len(got) != tc.limit {
+				t.Fatalf("bars = %d, want exactly %d", len(got), tc.limit)
+			}
+			for i, bar := range got {
+				want := dataset[tc.end-tc.limit+i].DateTime
+				if !bar.DateTime.Equal(want) {
+					t.Fatalf("bar %d time = %v, want %v", i, bar.DateTime, want)
+				}
+			}
+		})
+	}
+}
+
 // 验证无数据品种（如已到期期货）返回确定性错误而非空序列，供 V1 层映射为可流转错误码。
 func TestStockKLineRangeReturnsErrNoKLineData(t *testing.T) {
 	prev := FetchStockKLinePage
