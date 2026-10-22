@@ -68,7 +68,8 @@ func paginateBefore[T any](
 	toleratePartial bool,
 ) ([]T, error) {
 	count := uint16(limit)
-	if count > pageSize {
+	// cursor 需要从最新位置向后扫描，使用协议页大小；最终返回条数由过滤器限制。
+	if before != nil || count > pageSize {
 		count = pageSize
 	}
 	out := make([]T, 0, limit)
