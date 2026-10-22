@@ -66,8 +66,9 @@ func TestV1ProbeOnline(t *testing.T) {
 			Capabilities struct {
 				AssetClasses []string `json:"assetClasses"`
 				Bars         struct {
-					Periods     []string `json:"periods"`
-					Adjustments []string `json:"adjustments"`
+					Periods           []string `json:"periods"`
+					Adjustments       []string `json:"adjustments"`
+					MaxBarsPerRequest int      `json:"maxBarsPerRequest"`
 				} `json:"bars"`
 				TimeShare      bool `json:"timeShare"`
 				TimeShareRange struct {
@@ -85,6 +86,9 @@ func TestV1ProbeOnline(t *testing.T) {
 		t.Fatalf("probe = %#v, want online with requestId", body)
 	}
 	caps := body.Data.Capabilities
+	if caps.Bars.MaxBarsPerRequest != 798 {
+		t.Fatalf("bars.maxBarsPerRequest = %d, want 798", caps.Bars.MaxBarsPerRequest)
+	}
 	if len(caps.AssetClasses) != 6 || len(caps.Bars.Periods) != 10 {
 		t.Fatalf("capabilities = %#v, want 6 assetClasses and 10 periods", caps)
 	}
@@ -93,6 +97,21 @@ func TestV1ProbeOnline(t *testing.T) {
 	}
 	if caps.TimeShareRange.MaxTradingDays != v1MaxTimeShareRangeDays {
 		t.Fatalf("timeShareRange = %#v, want maxTradingDays=%d", caps.TimeShareRange, v1MaxTimeShareRangeDays)
+	}
+}
+
+// 验证股票、指数和扩展行情的目录能力均声明与 HTTP 校验一致的单页限制。
+func TestV1BarsCapabilityDeclaresRequestLimit(t *testing.T) {
+	for _, kind := range []string{domain.KindStock, domain.KindIndex, domain.KindEx} {
+		t.Run(kind, func(t *testing.T) {
+			encoded, err := json.Marshal(v1InstrumentCapabilitiesFor(kind))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Contains(encoded, []byte(`"maxBarsPerRequest":798`)) {
+				t.Fatalf("capabilities = %s, want declared 798-bar request limit", encoded)
+			}
+		})
 	}
 }
 
