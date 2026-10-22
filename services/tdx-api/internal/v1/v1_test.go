@@ -66,9 +66,8 @@ func TestV1ProbeOnline(t *testing.T) {
 			Capabilities struct {
 				AssetClasses []string `json:"assetClasses"`
 				Bars         struct {
-					Periods           []string `json:"periods"`
-					Adjustments       []string `json:"adjustments"`
-					MaxBarsPerRequest int      `json:"maxBarsPerRequest"`
+					Periods     []string `json:"periods"`
+					Adjustments []string `json:"adjustments"`
 				} `json:"bars"`
 				TimeShare      bool `json:"timeShare"`
 				TimeShareRange struct {
@@ -88,9 +87,6 @@ func TestV1ProbeOnline(t *testing.T) {
 	caps := body.Data.Capabilities
 	if len(caps.AssetClasses) != 6 || len(caps.Bars.Periods) != 10 {
 		t.Fatalf("capabilities = %#v, want 6 assetClasses and 10 periods", caps)
-	}
-	if caps.Bars.MaxBarsPerRequest != domain.MaxBarsPerRequest {
-		t.Fatalf("maxBarsPerRequest = %d, want %d", caps.Bars.MaxBarsPerRequest, domain.MaxBarsPerRequest)
 	}
 	if !caps.TimeShare || caps.Depth {
 		t.Fatalf("capabilities = %#v, want timeShare true depth false", caps)
@@ -171,9 +167,8 @@ func TestV1SearchMapsInstruments(t *testing.T) {
 				SessionID    string `json:"sessionId"`
 				Capabilities struct {
 					Bars struct {
-						Periods           []string `json:"periods"`
-						Adjustments       []string `json:"adjustments"`
-						MaxBarsPerRequest int      `json:"maxBarsPerRequest"`
+						Periods     []string `json:"periods"`
+						Adjustments []string `json:"adjustments"`
 					} `json:"bars"`
 					TimeShare bool `json:"timeShare"`
 				} `json:"capabilities"`
@@ -196,9 +191,6 @@ func TestV1SearchMapsInstruments(t *testing.T) {
 	}
 	if len(item.Capabilities.Bars.Adjustments) != 3 || item.Capabilities.Bars.Adjustments[2] != "none" {
 		t.Fatalf("adjustments = %v, want qfq/hfq/none", item.Capabilities.Bars.Adjustments)
-	}
-	if item.Capabilities.Bars.MaxBarsPerRequest != domain.MaxBarsPerRequest {
-		t.Fatalf("maxBarsPerRequest = %d, want %d", item.Capabilities.Bars.MaxBarsPerRequest, domain.MaxBarsPerRequest)
 	}
 }
 
@@ -433,35 +425,15 @@ func TestV1BarsRejectsUnsupportedAdjustment(t *testing.T) {
 	}
 }
 
-// 验证 bars limit 缺失、非正数或超过声明上限时返回 INVALID_REQUEST，错误消息使用同一常量。
+// 验证 bars limit 缺失、非正数或超过上游单页上限时返回 INVALID_REQUEST。
 func TestV1BarsRejectsInvalidLimit(t *testing.T) {
 	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
-	for _, limit := range []string{"", `,"limit":0`, `,"limit":` + strconv.Itoa(domain.MaxBarsPerRequest+1)} {
+	for _, limit := range []string{"", `,"limit":0`, `,"limit":799`} {
 		resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
 			`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none"`+limit+`}`)
 		if resp.Code != http.StatusBadRequest || !bytes.Contains(resp.Body.Bytes(), []byte(`"code":"INVALID_REQUEST"`)) {
 			t.Fatalf("limit suffix %q response = %d %s, want INVALID_REQUEST", limit, resp.Code, resp.Body.String())
 		}
-		if !bytes.Contains(resp.Body.Bytes(), []byte("limit must be between 1 and "+strconv.Itoa(domain.MaxBarsPerRequest))) {
-			t.Fatalf("limit suffix %q response = %s, want declared max %d", limit, resp.Body.String(), domain.MaxBarsPerRequest)
-		}
-	}
-}
-
-// 验证声明上限本身可通过 bars 参数校验：无数据时返回 INSTRUMENT_NOT_FOUND，而不是 INVALID_REQUEST。
-func TestV1BarsAcceptsDeclaredMaxLimit(t *testing.T) {
-	original := domain.FetchStockKLinePage
-	t.Cleanup(func() { domain.FetchStockKLinePage = original })
-	domain.FetchStockKLinePage = func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
-		return nil, nil
-	}
-
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
-	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
-		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none","limit":`+strconv.Itoa(domain.MaxBarsPerRequest)+`}`)
-
-	if resp.Code != http.StatusNotFound || !bytes.Contains(resp.Body.Bytes(), []byte(`"code":"INSTRUMENT_NOT_FOUND"`)) {
-		t.Fatalf("status = %d, want declared limit accepted then no data: %s", resp.Code, resp.Body.String())
 	}
 }
 

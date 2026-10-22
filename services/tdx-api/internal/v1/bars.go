@@ -60,9 +60,8 @@ func handleV1Bars(c *gin.Context) {
 		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "instrument.symbol is required")
 		return
 	}
-	if req.Limit < 1 || req.Limit > domain.MaxBarsPerRequest {
-		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest,
-			fmt.Sprintf("limit must be between 1 and %d", domain.MaxBarsPerRequest))
+	if req.Limit < 1 || req.Limit > 798 {
+		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "limit must be between 1 and 798")
 		return
 	}
 	timezone := v1ExchangeToTimezone(req.Instrument.Exchange)

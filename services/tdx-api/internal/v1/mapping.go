@@ -35,9 +35,8 @@ var v1AdjustToUint = map[string]uint16{
 
 // v1BarCapability V1 品种的 K 线能力。
 type v1BarCapability struct {
-	Periods           []string `json:"periods"`
-	Adjustments       []string `json:"adjustments"`
-	MaxBarsPerRequest int      `json:"maxBarsPerRequest"`
+	Periods     []string `json:"periods"`
+	Adjustments []string `json:"adjustments"`
 }
 
 // v1InstrumentCapabilities V1 品种可启用的行情能力。
@@ -82,9 +81,8 @@ func v1SourceCapabilitiesFor() v1SourceCapabilities {
 		TradingCalendar: true,
 		AssetClasses:    []string{"stock", "index", "fund", "future", "option", "forex"},
 		Bars: &v1BarCapability{
-			Periods:           append([]string(nil), v1KLinePeriods...),
-			Adjustments:       []string{"qfq", "hfq", "none"},
-			MaxBarsPerRequest: domain.MaxBarsPerRequest,
+			Periods:     append([]string(nil), v1KLinePeriods...),
+			Adjustments: []string{"qfq", "hfq", "none"},
 		},
 		TimeShare:      &timeShare,
 		TimeShareRange: &v1TimeShareRangeCapability{MaxTradingDays: v1MaxTimeShareRangeDays},
@@ -105,9 +103,8 @@ func v1InstrumentCapabilitiesFor(kind string) v1InstrumentCapabilities {
 	timeShare := true
 	return v1InstrumentCapabilities{
 		Bars: &v1BarCapability{
-			Periods:           append([]string(nil), v1KLinePeriods...),
-			Adjustments:       adjustments,
-			MaxBarsPerRequest: domain.MaxBarsPerRequest,
+			Periods:     append([]string(nil), v1KLinePeriods...),
+			Adjustments: adjustments,
 		},
 		TimeShare:      &timeShare,
 		TimeShareRange: &v1TimeShareRangeCapability{MaxTradingDays: v1MaxTimeShareRangeDays},
