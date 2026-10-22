@@ -42,3 +42,4 @@
 - 未知周期 / 不支持的复权返回 `UNSUPPORTED_CAPABILITY`，不静默回退日线
 - `providerRef` 由前端在搜索结果中原样带回，后端据此路由 kind 与 market/category
 - 能力声明区分源级（`probe`）与品种级（`search`），品种级按 kind 收敛复权范围
+- 源级与品种级 `bars.maxBarsPerRequest` 声明单次 K 线请求上限（798），与 HTTP 参数校验共用常量；更大的视口历史目标须使用 `beforeTimestamp` 游标分批请求，不能直接当作单页 `limit`

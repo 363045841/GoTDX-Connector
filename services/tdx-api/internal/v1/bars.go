@@ -11,6 +11,9 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// v1MaxBarsPerRequest 是 HTTP 校验与能力声明共用的单页根数上限。
+const v1MaxBarsPerRequest = 798
+
 // writeV1BarsError 统一映射 K 线查询错误：无数据返回确定性可流转码，上游故障返回网关错误。
 func writeV1BarsError(c *gin.Context, err error) {
 	if errors.Is(err, domain.ErrNoKLineData) {
@@ -60,8 +63,8 @@ func handleV1Bars(c *gin.Context) {
 		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "instrument.symbol is required")
 		return
 	}
-	if req.Limit < 1 || req.Limit > 798 {
-		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "limit must be between 1 and 798")
+	if req.Limit < 1 || req.Limit > v1MaxBarsPerRequest {
+		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, fmt.Sprintf("limit must be between 1 and %d", v1MaxBarsPerRequest))
 		return
 	}
 	timezone := v1ExchangeToTimezone(req.Instrument.Exchange)
