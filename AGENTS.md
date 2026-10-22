@@ -59,7 +59,7 @@ services/
 
 ## Conventions
 - V1 错误响应统一 envelope：`{"error": {"code", "message"}, "requestId"}`；确定性错误码见 `internal/v1`。
-- K-line page size: `klinePageSize = 798` (`services/tdx-api/internal/domain/kline_range.go`).
+- K-line page size: `klinePageSize = 798` (`services/tdx-api/internal/domain/kline_range.go`); the public `MaxBarsPerRequest = int(klinePageSize)` drives both the capability declaration and `/bars` validation.
 - 前端只走 V1 协议：`KLineChartQuant` packages/core/src/data/provider/sources/gotdx.ts
 
 ## Comment Style

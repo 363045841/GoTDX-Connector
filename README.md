@@ -54,6 +54,8 @@ go build -o tdx-api.exe ./services/tdx-api
 
 确定性错误码（触发前端请求流转）：`UNSUPPORTED_CAPABILITY`、`INSTRUMENT_NOT_FOUND`；上游故障为 `UPSTREAM_UNAVAILABLE`（不流转）。
 
+`bars` 能力声明包含 `maxBarsPerRequest`，与 `/bars` 的参数校验共用 `klinePageSize`（当前 798）。前端据此收敛单次请求根数，批量历史仍沿 cursor 分页获取。
+
 ### tdx-api — 健康检查
 
 | 方法 | 路由 | 说明 |

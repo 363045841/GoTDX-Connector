@@ -13,6 +13,9 @@ import (
 // klinePageSize 主站与扩展行情单次请求上限，保持在已验证的 800 条以内。
 const klinePageSize uint16 = 798
 
+// MaxBarsPerRequest 对外声明的单次 K 线请求上限，与内部分页 page size 共用同一常量。
+const MaxBarsPerRequest = int(klinePageSize)
+
 // indexPageSize GetIndexBars 单次请求上限，保持在已验证的 800 条以内
 const indexPageSize uint16 = 798
 
