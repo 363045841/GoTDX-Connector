@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"sync"
 	"time"
@@ -23,6 +24,7 @@ const (
 
 var ErrManagerClosed = errors.New("gotdx client manager is closed")
 var ErrDisconnected = errors.New("gotdx connection is unavailable")
+var ErrMalformedReply = errors.New("gotdx upstream reply is malformed")
 
 type domainConfig struct {
 	build   func() *gotdx.Client
@@ -30,10 +32,17 @@ type domainConfig struct {
 	close   func(*gotdx.Client) error
 }
 
+// clientLease 一代客户端及其在途请求计数。
+// 请求只在取客户端时持有 slot.mu，网络 I/O 不再持锁；重连换上新代后等待旧代在途归零再关闭。
+type clientLease struct {
+	client   *gotdx.Client
+	inflight sync.WaitGroup
+}
+
 type clientSlot struct {
 	mu                sync.RWMutex
 	reconnectMu       sync.Mutex
-	client            *gotdx.Client
+	lease             *clientLease
 	generation        uint64
 	ready             bool
 	lastError         string
@@ -132,6 +141,7 @@ func (manager *Manager) reconnectGeneration(domain Domain, failedGeneration uint
 		return nil
 	}
 
+	log.Printf("upstream reconnect started: domain=%s generation=%d", domain, manager.generation(domain))
 	replacement := slot.config.build()
 	if replacement == nil {
 		return manager.recordReconnectFailure(slot, domain, errors.New("no reachable hosts"))
@@ -154,8 +164,8 @@ func (manager *Manager) reconnectGeneration(domain Domain, failedGeneration uint
 		_ = slot.config.close(replacement)
 		return nil
 	}
-	old := slot.client
-	slot.client = replacement
+	previous := slot.lease
+	slot.lease = &clientLease{client: replacement}
 	slot.generation++
 	slot.ready = true
 	slot.lastError = ""
@@ -163,15 +173,18 @@ func (manager *Manager) reconnectGeneration(domain Domain, failedGeneration uint
 	slot.lastSuccess = time.Now()
 	slot.lastReconnect = time.Now()
 	slot.mu.Unlock()
-	if old != nil {
-		_ = slot.config.close(old)
+	if previous != nil {
+		previous.inflight.Wait()
+		_ = slot.config.close(previous.client)
 	}
+	log.Printf("upstream reconnect succeeded: domain=%s generation=%d", domain, manager.generation(domain))
 	return nil
 }
 
 func (manager *Manager) recordReconnectFailure(slot *clientSlot, domain Domain, err error) error {
+	log.Printf("upstream reconnect failed: domain=%s error=%v", domain, err)
 	slot.mu.Lock()
-	if slot.client == nil {
+	if slot.lease == nil {
 		slot.ready = false
 		slot.lastError = err.Error()
 	}
@@ -187,6 +200,7 @@ func execute[T any](manager *Manager, domain Domain, operation func(*gotdx.Clien
 	if err == nil || !isRecoverable(err) {
 		return result, err
 	}
+	log.Printf("upstream request failed, recovering: domain=%s generation=%d error=%v", domain, generation, err)
 	manager.recordOperationFailure(domain, generation, err)
 	if reconnectErr := manager.reconnectGeneration(domain, generation); reconnectErr != nil {
 		var zero T
@@ -227,17 +241,22 @@ func executeOnce[T any](manager *Manager, domain Domain, operation func(*gotdx.C
 	}
 	slot.mu.RLock()
 	manager.stateMu.RUnlock()
-	client := slot.client
+	lease := slot.lease
 	generation := slot.generation
-	if client == nil {
+	if lease == nil {
 		slot.mu.RUnlock()
 		if err := manager.reconnectGeneration(domain, generation); err != nil {
 			return zero, generation, err
 		}
 		return executeOnce(manager, domain, operation)
 	}
-	result, err := operation(client)
+	// 只把这一代客户端标记为在用，随后的网络 I/O 不持有 slot 锁。
+	lease.inflight.Add(1)
 	slot.mu.RUnlock()
+
+	result, err := invokeOperation(lease.client, operation)
+	lease.inflight.Done()
+
 	if err == nil {
 		slot.mu.Lock()
 		if slot.generation == generation {
@@ -248,6 +267,19 @@ func executeOnce[T any](manager *Manager, domain Domain, operation func(*gotdx.C
 		slot.mu.Unlock()
 	}
 	return result, generation, err
+}
+
+// invokeOperation 将依赖库的解析 panic 转成协议错误，确保租约释放并让调用方拿到可诊断结果。
+// 坏帧是整包读完后的解析失败，连接仍处于帧边界，因此不在此处重连。
+func invokeOperation[T any](current *gotdx.Client, operation func(*gotdx.Client) (T, error)) (result T, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			var zero T
+			result = zero
+			err = fmt.Errorf("%w: %v", ErrMalformedReply, recovered)
+		}
+	}()
+	return operation(current)
 }
 
 func isRecoverable(err error) bool {
@@ -312,12 +344,13 @@ func (manager *Manager) CloseContext(ctx context.Context) error {
 		for domain, slot := range manager.slots {
 			slot.reconnectMu.Lock()
 			slot.mu.Lock()
-			current := slot.client
-			slot.client = nil
+			current := slot.lease
+			slot.lease = nil
 			slot.ready = false
 			slot.mu.Unlock()
 			if current != nil {
-				if err := slot.config.close(current); err != nil {
+				current.inflight.Wait()
+				if err := slot.config.close(current.client); err != nil {
 					failures = append(failures, fmt.Errorf("close %s: %w", domain, err))
 				}
 			}

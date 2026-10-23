@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"KlineChartQuantGo/services/tdx-api/internal/client"
 	"github.com/bensema/gotdx/proto"
 )
 
@@ -52,70 +51,11 @@ type StockHistoryTickFetcher func(date uint32, market uint8, code string) ([]pro
 // ExHistoryTickFetcher 扩展行情历史分时拉取签名。
 type ExHistoryTickFetcher func(date uint32, category uint8, code string) ([]proto.ExTickChartData, error)
 
-// 分时可测注入点：复用主站/扩展行情历史分时拉取，测试可替换。
-var (
-	FetchStockHistoryTick StockHistoryTickFetcher = func(date uint32, market uint8, code string) ([]proto.HistoryMinuteTimeData, error) {
-		return mainCall(func(c client.MainQuerier) ([]proto.HistoryMinuteTimeData, error) {
-			return c.StockHistoryTickChart(date, market, code)
-		})
-	}
-	FetchExHistoryTick ExHistoryTickFetcher = func(date uint32, category uint8, code string) ([]proto.ExTickChartData, error) {
-		return exCall(func(c client.ExQuerier) ([]proto.ExTickChartData, error) {
-			return c.ExTickChart(category, code, date)
-		})
-	}
-)
-
-// FetchOpeningTrade 按日期选逐笔源：当日用 StockFullTransaction，历史日用 StockHistoryFullTransaction。
-var FetchOpeningTrade = DefaultFetchOpeningTrade
-
-// DefaultFetchOpeningTrade 生产默认开盘首笔拉取，可测注入点见 FetchOpeningTrade。
-func DefaultFetchOpeningTrade(date uint32, market uint8, code string, now time.Time) (OpeningTrade, bool) {
-	loc := time.FixedZone("CST", 8*60*60)
-	now = now.In(loc)
-	currentDate := uint32(now.Year()*10000 + int(now.Month())*100 + now.Day())
-	if date == currentDate {
-		trans, err := mainCall(func(c client.MainQuerier) ([]proto.TransactionData, error) {
-			return c.StockFullTransaction(market, code)
-		})
-		if err != nil || len(trans) == 0 {
-			return OpeningTrade{}, false
-		}
-		return OpeningTrade{Price: trans[0].Price, Vol: trans[0].Vol}, true
-	}
-	trans, err := mainCall(func(c client.MainQuerier) ([]proto.HistoryTransactionData, error) {
-		return c.StockHistoryFullTransaction(date, market, code)
-	})
-	if err != nil || len(trans) == 0 {
-		return OpeningTrade{}, false
-	}
-	return OpeningTrade{Price: trans[0].Price, Vol: trans[0].Vol}, true
-}
-
 // StockPreCloseSource 分时昨收依赖，now/quote/dailyBars 可测注入。
 type StockPreCloseSource struct {
 	Now       func() time.Time
 	Quote     func(market uint8, code string) (float64, error)
 	DailyBars func(market uint8, code string, date time.Time) ([]proto.SecurityBar, error)
-}
-
-// NewDefaultStockPreCloseSource 构造主站分时昨收的默认依赖；dailyBars 按 kind 由 NormalizeStockPreCloseSource 装配。
-func NewDefaultStockPreCloseSource() StockPreCloseSource {
-	return StockPreCloseSource{
-		Now: time.Now,
-		Quote: func(market uint8, code string) (float64, error) {
-			quotes, err := mainCall(func(c client.MainQuerier) ([]proto.SecurityQuote, error) {
-				return c.StockQuotesDetail([]uint8{market}, []string{code})
-			})
-			if err != nil {
-				return 0, err
-			}
-			if len(quotes) == 0 {
-				return 0, errors.New("empty realtime quote response")
-			}
-			return quotes[0].PreClose, nil
-		},
-	}
 }
 
 // ResolveStockPreClose 当日读取实时行情，历史日读取目标日线的前收价。
@@ -171,29 +111,6 @@ type ExPreCloseSource struct {
 	DailyBars func(category uint8, code string, date time.Time) ([]proto.ExKLineItem, error)
 }
 
-// NewDefaultExPreCloseSource 构造扩展行情分时昨收的默认依赖。
-func NewDefaultExPreCloseSource() ExPreCloseSource {
-	return ExPreCloseSource{
-		Now: time.Now,
-		Quote: func(category uint8, code string) (float64, error) {
-			q, err := exCall(func(c client.ExQuerier) (*proto.ExQuoteItem, error) {
-				return c.ExQuote(category, code)
-			})
-			if err != nil {
-				return 0, err
-			}
-			if q == nil {
-				return 0, errors.New("empty ex quote response")
-			}
-			return q.PreClose, nil
-		},
-		DailyBars: func(category uint8, code string, date time.Time) ([]proto.ExKLineItem, error) {
-			// period 4 = 日线（与前端 PERIOD_TO_CATEGORY.daily 对齐）
-			return ExKLineRange(category, code, 4, 1, date, date)
-		},
-	}
-}
-
 // ResolveExPreClose 解析扩展行情分时昨收：目标日线为 SSOT，实时行情仅作当日日线缺失时的回退。
 // 不能优先实时行情：gotdx ExQuote.PreClose 对美股返回当日现价（非昨收），港股则常为 0，均不可靠；
 // 日线 ExKLine 的 PreClose 经实测与交易日历一致。
@@ -243,31 +160,8 @@ func ExKLinePreClose(bar proto.ExKLineItem) float64 {
 	return bar.Open
 }
 
-// NormalizeStockPreCloseSource 填充分时昨收源的默认依赖（now/quote/dailyBars）。
-func NormalizeStockPreCloseSource(src StockPreCloseSource, req StockTimeShareRequest, isIndex bool) StockPreCloseSource {
-	if src.Now == nil {
-		src.Now = time.Now
-	}
-	if src.Quote == nil {
-		src.Quote = NewDefaultStockPreCloseSource().Quote
-	}
-	if src.DailyBars == nil {
-		if isIndex {
-			indexMarket, indexCode := req.Market, req.Code
-			src.DailyBars = func(_ uint8, _ string, date time.Time) ([]proto.SecurityBar, error) {
-				return IndexKLineRange(4, indexMarket, indexCode, date, date)
-			}
-		} else {
-			src.DailyBars = func(market uint8, code string, date time.Time) ([]proto.SecurityBar, error) {
-				return StockKLineRange(4, market, code, 1, 0, date, date)
-			}
-		}
-	}
-	return src
-}
-
 // BuildStockTimeSharePoints 构建 A 股/指数历史分时点，含开盘首笔补入与指数成交额换算。
-func BuildStockTimeSharePoints(req StockTimeShareRequest, fetchTick StockHistoryTickFetcher, now func() time.Time) ([]TimeSharePoint, error) {
+func BuildStockTimeSharePoints(req StockTimeShareRequest, fetchTick StockHistoryTickFetcher, fetchOpening OpeningTradeFetcher, now func() time.Time) ([]TimeSharePoint, error) {
 	tick, err := fetchTick(req.Date, req.Market, req.Code)
 	if err != nil {
 		return nil, err
@@ -281,7 +175,7 @@ func BuildStockTimeSharePoints(req StockTimeShareRequest, fetchTick StockHistory
 
 	var first *TimeSharePoint
 	if len(tick) > 0 {
-		if trade, ok := FetchOpeningTrade(req.Date, req.Market, req.Code, now()); ok {
+		if trade, ok := fetchOpening(req.Date, req.Market, req.Code, now()); ok {
 			p := &TimeSharePoint{
 				At:    base.Add(9*time.Hour + 30*time.Minute),
 				Price: trade.Price,

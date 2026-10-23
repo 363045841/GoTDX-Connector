@@ -308,6 +308,28 @@ func TestHubPollsImmediatelyWhenMarketOpens(t *testing.T) {
 	waitFor(t, func() bool { return f.calls.Load() >= 2 })
 }
 
+// 验证 Close 停止全部轮询器、拒绝新订阅且可重复调用。
+func TestHubCloseStopsPollersAndRejectsSubscriptions(t *testing.T) {
+	hub := NewHub(testConfig())
+	sub, err := hub.Subscribe("k", Source{Fetch: func(context.Context) ([]Bar, error) {
+		return []Bar{bar(1, 1)}, nil
+	}})
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+
+	hub.Close()
+	select {
+	case <-sub.poller.done:
+	default:
+		t.Fatal("poller still running after Close")
+	}
+	if _, err := hub.Subscribe("k2", Source{Fetch: func(context.Context) ([]Bar, error) { return nil, nil }}); !errors.Is(err, ErrHubClosed) {
+		t.Fatalf("subscribe after close = %v, want ErrHubClosed", err)
+	}
+	hub.Close()
+}
+
 // 验证全局订阅数与序列数上限。
 func TestHubBoundsSubscriptionsAndSeries(t *testing.T) {
 	cfg := testConfig()

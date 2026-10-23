@@ -61,7 +61,7 @@ func runHeartbeat(ctx context.Context, ticks <-chan time.Time, monitor *heartbea
 }
 
 // StartHeartbeat 启动 main 行情连接的定时保活，连续失败达到阈值后重新探测连接。
-func StartHeartbeat(ctx context.Context, interval time.Duration, failureThreshold int) (<-chan struct{}, error) {
+func StartHeartbeat(ctx context.Context, manager *Manager, interval time.Duration, failureThreshold int) (<-chan struct{}, error) {
 	if interval <= 0 {
 		return nil, errors.New("heartbeat interval must be positive")
 	}
@@ -69,11 +69,10 @@ func StartHeartbeat(ctx context.Context, interval time.Duration, failureThreshol
 		return nil, errors.New("heartbeat failure threshold must be positive")
 	}
 
-	manager := DefaultManager()
 	var failedGeneration uint64
 	monitor := newHeartbeatMonitor(failureThreshold, func() error {
 		failedGeneration = manager.generation(DomainMain)
-		_, err := ProbeMain(func(c MainQuerier) (*proto.HeartBeatReply, error) {
+		_, err := ProbeMain(manager, func(c MainQuerier) (*proto.HeartBeatReply, error) {
 			return c.GetServerHeartbeat()
 		})
 		return err

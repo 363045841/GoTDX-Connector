@@ -1,44 +1,35 @@
-// 品种 kind 常量与主市场判定辅助，供 api/v1 两层 K 线路由共用。
+// 品种 kind 常量与主市场判定辅助；kind 词汇的唯一来源是 instrument 包。
 package domain
 
 import (
-	"fmt"
 	"strings"
 
-	"github.com/bensema/gotdx/types"
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 )
 
-// 搜索结果 params.kind：与 gotdx types 品种分类对齐，供 K 线路由使用。
+// 搜索结果 kind：与 instrument 包定义保持一致。
 const (
-	KindStock = "stock"
-	KindIndex = "index"
-	KindEx    = "ex"
+	KindStock = string(instrument.Stock)
+	KindIndex = string(instrument.Index)
+	KindEx    = string(instrument.Ex)
 )
 
 // MainExchange 返回主市场行情代码对应的交易所缩写。
 func MainExchange(market uint8) string {
-	switch market {
-	case 0:
-		return "SZ"
-	case 1:
-		return "SH"
-	case 2:
-		return "BJ"
-	default:
-		return ""
-	}
+	return instrument.Exchange(market)
 }
 
-// MainMarketSymbolKind 用 gotdx types.IsIndex(code.EXCHANGE) 判定主市场品种
+// MainMarketSymbolKind 用代码所属市场判定品种是股票还是指数。
+// 市场未知时按股票处理，由后续路由校验拒绝非法组合。
 func MainMarketSymbolKind(code, exchange string) string {
-	// IsIndex 要求 9 位形如 000001.SH
-	if types.IsIndex(fmt.Sprintf("%s.%s", code, strings.ToUpper(exchange))) {
-		return KindIndex
+	market, ok := instrument.MarketForExchange(exchange)
+	if !ok {
+		return KindStock
 	}
-	return KindStock
+	return string(instrument.KindForMainMarket(code, market))
 }
 
-// IsIndexKind 是否按指数接口拉线：优先 kind，否则 IsIndex(code.EXCHANGE)
+// IsIndexKind 是否按指数接口拉线：优先 kind，否则按代码与市场判定。
 func IsIndexKind(kind string, market uint8, code string) bool {
 	switch strings.ToLower(strings.TrimSpace(kind)) {
 	case KindIndex:
@@ -46,6 +37,5 @@ func IsIndexKind(kind string, market uint8, code string) bool {
 	case KindStock, KindEx:
 		return false
 	}
-	// kind 未传时，用 gotdx 规则判定（不猜 market alone）
-	return MainMarketSymbolKind(code, MainExchange(market)) == KindIndex
+	return instrument.IsIndexCode(code, market)
 }

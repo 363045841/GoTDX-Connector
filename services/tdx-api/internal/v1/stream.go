@@ -8,15 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
-	"os"
-	"regexp"
-	"strconv"
-	"strings"
 	"time"
 
 	"KlineChartQuantGo/services/tdx-api/internal/directory"
 	"KlineChartQuantGo/services/tdx-api/internal/domain"
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 	"KlineChartQuantGo/services/tdx-api/internal/live"
 	"github.com/bensema/gotdx/proto"
 	"github.com/gin-gonic/gin"
@@ -32,23 +30,19 @@ const liveHeartbeatInterval = 15 * time.Second
 // liveRetryMillis 建议 EventSource 断线后的重连等待。
 const liveRetryMillis = 3000
 
-// liveCodePattern 主市场证券代码格式。
-var liveCodePattern = regexp.MustCompile(`^[0-9A-Za-z]{1,12}$`)
-
-// liveTarget 已解析的实时订阅品种（仅主市场 A 股/指数）。
-type liveTarget struct {
-	Kind   string
-	Market uint8
-	Code   string
+// liveSeries 实时订阅的上游查询身份；路由由统一解析器给出。
+type liveSeries struct {
+	Routing instrument.Routing
+	Code    string
 }
 
-// instrumentID 返回与搜索接口一致的稳定品种 ID。
-func (t liveTarget) instrumentID() string {
-	return v1InstrumentID(t.Kind, int(t.Market), t.Code)
+// ID 返回与搜索接口一致的规范品种 ID。
+func (s liveSeries) ID() string {
+	return s.Routing.ID(v1SourceID, s.Code)
 }
 
 // liveFetchBuilder 为目标品种构造上游拉取函数；测试可替换以避免访问 gotdx。
-type liveFetchBuilder func(target liveTarget, category, adjust uint16) live.FetchFunc
+type liveFetchBuilder func(target liveSeries, category, adjust uint16) live.FetchFunc
 
 // liveStreamDeps 实时流处理器依赖。
 type liveStreamDeps struct {
@@ -59,25 +53,10 @@ type liveStreamDeps struct {
 	heartbeat time.Duration
 }
 
-// liveHubConfigFromEnv 读取实时流环境变量：轮询间隔与订阅上限。
-func liveHubConfigFromEnv() live.Config {
-	cfg := live.DefaultConfig()
-	if d, err := time.ParseDuration(os.Getenv("GOTDX_LIVE_POLL_INTERVAL")); err == nil && d >= 500*time.Millisecond {
-		cfg.OpenInterval = d
-	}
-	if n, err := strconv.Atoi(os.Getenv("GOTDX_LIVE_MAX_STREAMS")); err == nil && n > 0 {
-		cfg.MaxSubscriptions = n
-	}
-	if n, err := strconv.Atoi(os.Getenv("GOTDX_LIVE_MAX_SERIES")); err == nil && n > 0 {
-		cfg.MaxSeries = n
-	}
-	return cfg
-}
-
 // handleV1Stream 创建生产用实时 K 线 SSE 处理器。
-func handleV1Stream(hub *live.Hub, cache *directory.Cache) gin.HandlerFunc {
+func handleV1Stream(hub *live.Hub, cache *directory.Cache, fetch domain.Fetcher) gin.HandlerFunc {
 	return handleV1StreamWithDeps(liveStreamDeps{
-		hub: hub, cache: cache, fetch: gotdxLiveFetch, session: cnLiveSession,
+		hub: hub, cache: cache, fetch: gotdxLiveFetch(fetch), session: cnLiveSession,
 		heartbeat: liveHeartbeatInterval,
 	})
 }
@@ -105,9 +84,9 @@ func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 		}
 		// 实时尾部的 qfq 与 none 数值一致（前复权以最新价为基准），默认 none；hfq 需显式指定。
 		adjustment := c.DefaultQuery("adjustment", "none")
-		if !v1AdjustmentSupported(target.Kind, adjustment) {
+		if !v1AdjustmentSupported(string(target.Routing.Kind), adjustment) {
 			writeV1Error(c, http.StatusBadRequest, v1CodeUnsupportedCapability,
-				fmt.Sprintf("adjustment %q is not supported for kind %q", adjustment, target.Kind))
+				fmt.Sprintf("adjustment %q is not supported for kind %q", adjustment, target.Routing.Kind))
 			return
 		}
 		adjust := v1AdjustToUint[adjustment]
@@ -116,7 +95,7 @@ func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 		}
 
 		// barAggregation 与 bars 接口一致：gotdx 只提供上游原生周期边界，不参与序列身份。
-		key := fmt.Sprintf("%s|%s|%d", target.instrumentID(), period, adjust)
+		key := fmt.Sprintf("%s|%s|%d", target.ID(), period, adjust)
 		sub, err := deps.hub.Subscribe(key, live.Source{
 			Fetch:   deps.fetch(target, category, adjust),
 			Session: deps.session,
@@ -135,7 +114,7 @@ func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 		h.Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
 		// 首包立即下发，触发 EventSource onopen 并冲开代理缓冲。
-		if _, err := fmt.Fprintf(w, "retry: %d\n: connected %s\n\n", liveRetryMillis, target.instrumentID()); err != nil {
+		if _, err := fmt.Fprintf(w, "retry: %d\n: connected %s\n\n", liveRetryMillis, target.ID()); err != nil {
 			return
 		}
 		w.Flush()
@@ -209,152 +188,52 @@ func encodeLiveFrame(symbol, period string, ev live.Event) ([]byte, error) {
 	}
 }
 
-// resolveLiveTarget 把请求解析为主市场品种。优先级：instrumentId（或 symbol 本身即 ID）→
-// symbol 带 .SZ/.SH/.BJ 后缀 → exchange 参数 → 证券目录精确匹配（多义时要求消歧）。
+// resolveLiveTarget 把请求解析为主市场品种；解析规则与 bars/timeshare 完全一致。
 // 返回的 HTTP 状态仅在 apiErr 非空时有意义。
-func resolveLiveTarget(cache *directory.Cache, symbol, instrumentID, exchange string) (liveTarget, *v1APIError, int) {
-	symbol = strings.TrimSpace(symbol)
-	if instrumentID == "" && strings.HasPrefix(symbol, v1SourceID+":") {
-		instrumentID = symbol
+func resolveLiveTarget(cache *directory.Cache, symbol, instrumentID, exchange string) (liveSeries, *v1APIError, int) {
+	resolved, apiErr, status := resolveInstrument(v1InstrumentReference{
+		ID: instrumentID, Symbol: symbol, Exchange: exchange,
+	}, cache)
+	if apiErr != nil {
+		return liveSeries{}, apiErr, status
 	}
-	if instrumentID != "" {
-		return parseLiveInstrumentID(instrumentID)
+	if resolved.Routing.Kind == instrument.Ex {
+		return liveSeries{}, &v1APIError{
+			Code:    v1CodeUnsupportedCapability,
+			Message: "live bars are not supported for kind " + string(resolved.Routing.Kind),
+		}, http.StatusBadRequest
 	}
-	if symbol == "" {
-		return liveTarget{}, &v1APIError{Code: v1CodeInvalidRequest, Message: "symbol is required"}, http.StatusBadRequest
-	}
-	code := symbol
-	if dot := strings.LastIndexByte(symbol, '.'); dot > 0 {
-		code, exchange = symbol[:dot], symbol[dot+1:]
-	}
-	if !liveCodePattern.MatchString(code) {
-		return liveTarget{}, &v1APIError{Code: v1CodeInvalidRequest, Message: fmt.Sprintf("invalid symbol %q", symbol)}, http.StatusBadRequest
-	}
-	if exchange != "" {
-		market, ok := liveMarketForExchange(exchange)
-		if !ok {
-			return liveTarget{}, &v1APIError{Code: v1CodeUnsupportedCapability,
-				Message: fmt.Sprintf("live bars are not supported for exchange %q", exchange)}, http.StatusBadRequest
-		}
-		return liveTarget{Kind: domain.MainMarketSymbolKind(code, domain.MainExchange(market)), Market: market, Code: code}, nil, 0
-	}
-	return lookupLiveTarget(cache, code)
-}
-
-// parseLiveInstrumentID 解析 gotdx:{kind}:{market}:{code}；扩展行情不支持实时流。
-func parseLiveInstrumentID(id string) (liveTarget, *v1APIError, int) {
-	parts := strings.Split(id, ":")
-	if len(parts) != 4 || parts[0] != v1SourceID {
-		return liveTarget{}, &v1APIError{Code: v1CodeInvalidRequest, Message: fmt.Sprintf("invalid instrumentId %q", id)}, http.StatusBadRequest
-	}
-	kind, code := parts[1], parts[3]
-	if kind != domain.KindStock && kind != domain.KindIndex {
-		return liveTarget{}, &v1APIError{Code: v1CodeUnsupportedCapability,
-			Message: fmt.Sprintf("live bars are not supported for kind %q", kind)}, http.StatusBadRequest
-	}
-	market, err := strconv.Atoi(parts[2])
-	if err != nil || market < 0 || market > 2 || !liveCodePattern.MatchString(code) {
-		return liveTarget{}, &v1APIError{Code: v1CodeInvalidRequest, Message: fmt.Sprintf("invalid instrumentId %q", id)}, http.StatusBadRequest
-	}
-	return liveTarget{Kind: kind, Market: uint8(market), Code: code}, nil, 0
-}
-
-// liveMarketForExchange 主市场交易所缩写到 gotdx market。
-func liveMarketForExchange(exchange string) (uint8, bool) {
-	switch strings.ToUpper(strings.TrimSpace(exchange)) {
-	case "SZ":
-		return 0, true
-	case "SH":
-		return 1, true
-	case "BJ":
-		return 2, true
-	default:
-		return 0, false
-	}
-}
-
-// lookupLiveTarget 在证券目录中按代码精确匹配主市场品种；同码跨市场（如 000001 平安银行/上证指数）时拒绝猜测。
-func lookupLiveTarget(cache *directory.Cache, code string) (liveTarget, *v1APIError, int) {
-	if cache == nil {
-		return liveTarget{}, &v1APIError{Code: v1CodeUpstreamUnavailable, Message: "symbol directory unavailable; pass instrumentId or exchange"}, http.StatusServiceUnavailable
-	}
-	items, err := cache.Search(code, maxSearchLimit)
-	if err != nil {
-		return liveTarget{}, &v1APIError{Code: v1CodeUpstreamUnavailable, Message: err.Error()}, http.StatusServiceUnavailable
-	}
-	var found []liveTarget
-	for _, item := range items {
-		if item.Symbol != code {
-			continue
-		}
-		kind := v1ProviderRefKind(item.Params)
-		market, ok := liveParamMarket(item.Params["market"])
-		if !ok || (kind != domain.KindStock && kind != domain.KindIndex) {
-			continue
-		}
-		found = append(found, liveTarget{Kind: kind, Market: market, Code: code})
-	}
-	switch len(found) {
-	case 1:
-		return found[0], nil, 0
-	case 0:
-		return liveTarget{}, &v1APIError{Code: v1CodeInstrumentNotFound,
-			Message: fmt.Sprintf("no A-share/index instrument with symbol %q", code)}, http.StatusNotFound
-	default:
-		candidates := make([]string, 0, len(found))
-		for _, t := range found {
-			candidates = append(candidates, t.instrumentID())
-		}
-		return liveTarget{}, &v1APIError{Code: v1CodeInvalidRequest,
-			Message: fmt.Sprintf("symbol %q is ambiguous; pass instrumentId or exchange", code),
-			Details: map[string]any{"candidates": candidates}}, http.StatusBadRequest
-	}
-}
-
-// liveParamMarket 读取目录条目的 market：内存目录为 uint8，SQLite/JSON 回读可能为其他数值类型。
-func liveParamMarket(v any) (uint8, bool) {
-	var n int64
-	switch x := v.(type) {
-	case uint8:
-		n = int64(x)
-	case int:
-		n = int64(x)
-	case int64:
-		n = x
-	case float64:
-		n = int64(x)
-	default:
-		return 0, false
-	}
-	if n < 0 || n > 2 {
-		return 0, false
-	}
-	return uint8(n), true
+	return liveSeries{Routing: resolved.Routing, Code: resolved.Symbol}, nil, 0
 }
 
 // gotdxLiveFetch 构造访问 gotdx 的尾部拉取函数；映射复用 bars 接口，保证时间戳与数值口径一致。
-func gotdxLiveFetch(target liveTarget, category, adjust uint16) live.FetchFunc {
-	return func(context.Context) ([]live.Bar, error) {
-		var (
-			bars []proto.SecurityBar
-			err  error
-		)
-		if target.Kind == domain.KindIndex {
-			bars, err = domain.IndexKLineBefore(category, target.Market, target.Code, liveFetchSize, nil)
-		} else {
-			bars, err = domain.StockKLineBefore(category, target.Market, target.Code, 1, adjust, liveFetchSize, nil)
+func gotdxLiveFetch(source domain.Fetcher) liveFetchBuilder {
+	return func(target liveSeries, category, adjust uint16) live.FetchFunc {
+		return func(context.Context) ([]live.Bar, error) {
+			started := time.Now()
+			var (
+				bars []proto.SecurityBar
+				err  error
+			)
+			if target.Routing.Kind == instrument.Index {
+				bars, err = domain.IndexKLineBefore(source, category, target.Routing.Market, target.Code, liveFetchSize, nil)
+			} else {
+				bars, err = domain.StockKLineBefore(source, category, target.Routing.Market, target.Code, 1, adjust, liveFetchSize, nil)
+			}
+			if errors.Is(err, domain.ErrNoKLineData) {
+				return nil, nil
+			}
+			if err != nil {
+				log.Printf("live bars query failed: instrument=%s category=%d adjust=%d elapsed=%s error=%v",
+					target.ID(), category, adjust, time.Since(started).Round(time.Millisecond), err)
+				return nil, err
+			}
+			out := make([]live.Bar, 0, len(bars))
+			for _, bar := range bars {
+				out = append(out, securityBarToLiveBar(bar))
+			}
+			return out, nil
 		}
-		if errors.Is(err, domain.ErrNoKLineData) {
-			return nil, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		out := make([]live.Bar, 0, len(bars))
-		for _, bar := range bars {
-			out = append(out, securityBarToLiveBar(bar))
-		}
-		return out, nil
 	}
 }
 

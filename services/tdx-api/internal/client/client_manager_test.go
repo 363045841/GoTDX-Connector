@@ -38,6 +38,40 @@ func testManager(t *testing.T, domains ...Domain) (*Manager, map[Domain]*atomic.
 	return manager, builds
 }
 
+// 验证解析 panic 释放租约、不触发重连，并允许后续请求和关闭完成。
+func TestOperationPanicReleasesLeaseWithoutReconnect(t *testing.T) {
+	manager, builds := testManager(t, DomainMain)
+	done := make(chan error, 1)
+	go func() {
+		_, err := execute(manager, DomainMain, func(*gotdx.Client) (int, error) {
+			panic("slice bounds out of range")
+		})
+		if !errors.Is(err, ErrMalformedReply) {
+			done <- fmt.Errorf("panic error = %v, want ErrMalformedReply", err)
+			return
+		}
+		// 坏帧是整包读完后解析失败，连接仍在帧边界，不应重建连接。
+		if builds[DomainMain].Load() != 1 {
+			done <- fmt.Errorf("builds = %d, want no reconnect on malformed reply", builds[DomainMain].Load())
+			return
+		}
+		value, err := execute(manager, DomainMain, func(*gotdx.Client) (int, error) { return 42, nil })
+		if err != nil || value != 42 {
+			done <- fmt.Errorf("subsequent query = %d, %v", value, err)
+			return
+		}
+		done <- manager.Close()
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("panic recovery, subsequent query or close blocked")
+	}
+}
+
 // 验证重连等待正在执行的客户端租约释放。
 func TestReconnectWaitsForActiveLease(t *testing.T) {
 	manager, _ := testManager(t, DomainMain)

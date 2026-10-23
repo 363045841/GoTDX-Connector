@@ -100,7 +100,7 @@ type Config struct {
 // DefaultConfig 返回生产默认参数。
 func DefaultConfig() Config {
 	return Config{
-		OpenInterval:     2 * time.Second,
+		OpenInterval:     5 * time.Second,
 		ClosedInterval:   60 * time.Second,
 		ErrorInterval:    5 * time.Second,
 		MaxSubscriptions: 256,
@@ -141,10 +141,11 @@ func (c Config) withDefaults() Config {
 	return c
 }
 
-// 订阅上限错误。
+// 订阅上限与生命周期错误。
 var (
 	ErrTooManySubscriptions = errors.New("live bars: too many subscriptions")
 	ErrTooManySeries        = errors.New("live bars: too many distinct series")
+	ErrHubClosed            = errors.New("live bars: hub closed")
 )
 
 // Hub 实时 K 线中枢：按 key 共享轮询器并统计全局订阅数。
@@ -153,6 +154,7 @@ type Hub struct {
 	mu      sync.Mutex
 	pollers map[string]*poller
 	subs    int
+	closed  bool
 }
 
 // NewHub 创建实时 K 线中枢。
@@ -171,6 +173,9 @@ func (h *Hub) Stats() (series, subscriptions int) {
 func (h *Hub) Subscribe(key string, src Source) (*Subscription, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	if h.closed {
+		return nil, ErrHubClosed
+	}
 	if h.subs >= h.cfg.MaxSubscriptions {
 		return nil, ErrTooManySubscriptions
 	}
@@ -193,6 +198,28 @@ func (h *Hub) Subscribe(key string, src Source) (*Subscription, error) {
 	h.subs++
 	p.add(sub)
 	return sub, nil
+}
+
+// Close 停止全部轮询器并等待退出；关闭后不再接受新订阅。
+func (h *Hub) Close() {
+	h.mu.Lock()
+	if h.closed {
+		h.mu.Unlock()
+		return
+	}
+	h.closed = true
+	pollers := make([]*poller, 0, len(h.pollers))
+	for _, p := range h.pollers {
+		pollers = append(pollers, p)
+	}
+	h.mu.Unlock()
+
+	for _, p := range pollers {
+		p.cancel()
+	}
+	for _, p := range pollers {
+		<-p.done
+	}
 }
 
 // release 移除订阅；序列无人订阅时停止并移除其轮询器。

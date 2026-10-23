@@ -6,22 +6,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 	_ "modernc.org/sqlite"
 )
+
+// sqliteSchemaVersion 目录表结构版本；目录是可重建缓存，版本不符时直接丢弃旧表。
+const sqliteSchemaVersion = 2
 
 const sqliteSchema = `
 CREATE TABLE IF NOT EXISTS symbol_directory (
 	source TEXT NOT NULL,
-	param_kind TEXT NOT NULL CHECK (param_kind IN ('market', 'category')),
-	param_value INTEGER NOT NULL CHECK (param_value BETWEEN 0 AND 255),
+	kind TEXT NOT NULL CHECK (kind IN ('stock', 'index', 'ex')),
+	market INTEGER NOT NULL CHECK (market BETWEEN 0 AND 255),
+	category INTEGER NOT NULL CHECK (category BETWEEN 0 AND 255),
 	symbol TEXT NOT NULL,
 	description TEXT NOT NULL,
 	exchange TEXT NOT NULL,
-	kind TEXT NOT NULL DEFAULT 'stock',
-	PRIMARY KEY (source, param_kind, param_value, symbol)
+	PRIMARY KEY (source, kind, market, category, symbol)
 );
 CREATE TABLE IF NOT EXISTS symbol_directory_metadata (
 	id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -46,18 +49,38 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 		return nil, fmt.Errorf("open symbol database: %w", err)
 	}
 	db.SetMaxOpenConns(1)
+
+	version, err := schemaVersion(db)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if version != sqliteSchemaVersion {
+		if _, err := db.Exec(`DROP TABLE IF EXISTS symbol_directory; DROP TABLE IF EXISTS symbol_directory_metadata;`); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("reset symbol database: %w", err)
+		}
+	}
 	if _, err := db.Exec(sqliteSchema); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("initialize symbol database: %w", err)
 	}
-	// 旧库补 kind 列；已存在则忽略
-	if _, err := db.Exec(`ALTER TABLE symbol_directory ADD COLUMN kind TEXT NOT NULL DEFAULT 'stock'`); err != nil {
-		if !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+	if version != sqliteSchemaVersion {
+		if _, err := db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, sqliteSchemaVersion)); err != nil {
 			_ = db.Close()
-			return nil, fmt.Errorf("migrate symbol directory kind column: %w", err)
+			return nil, fmt.Errorf("set symbol database version: %w", err)
 		}
 	}
 	return &SQLiteStore{db: db}, nil
+}
+
+// schemaVersion 读取 SQLite 的 user_version。
+func schemaVersion(db *sql.DB) (int, error) {
+	var version int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return 0, fmt.Errorf("read symbol database version: %w", err)
+	}
+	return version, nil
 }
 
 // Load 读取证券目录快照；无快照时返回 found=false。
@@ -78,7 +101,7 @@ func (s *SQLiteStore) Load() (Snapshot, bool, error) {
 	}
 
 	rows, err := tx.Query(`
-		SELECT source, param_kind, param_value, symbol, description, exchange, kind
+		SELECT source, kind, market, category, symbol, description, exchange
 		FROM symbol_directory
 		ORDER BY rowid`)
 	if err != nil {
@@ -87,17 +110,17 @@ func (s *SQLiteStore) Load() (Snapshot, bool, error) {
 	entries := make([]Item, 0)
 	for rows.Next() {
 		var item Item
-		var paramKind string
-		var paramValue uint8
 		var kind string
-		if err := rows.Scan(&item.Source, &paramKind, &paramValue, &item.Symbol, &item.Description, &item.Exchange, &kind); err != nil {
+		var market, category uint8
+		if err := rows.Scan(&item.Source, &kind, &market, &category, &item.Symbol, &item.Description, &item.Exchange); err != nil {
 			_ = rows.Close()
 			return Snapshot{}, false, fmt.Errorf("scan symbol directory: %w", err)
 		}
-		if kind == "" {
-			kind = KindStock
+		item.Routing = instrument.Routing{Kind: instrument.Kind(kind), Market: market, Category: category}
+		if err := item.Routing.Validate(item.Symbol); err != nil {
+			_ = rows.Close()
+			return Snapshot{}, false, fmt.Errorf("invalid stored symbol %s: %w", item.Symbol, err)
 		}
-		item.Params = map[string]any{paramKind: paramValue, "kind": kind}
 		entries = append(entries, item)
 	}
 	if err := rows.Err(); err != nil {
@@ -129,7 +152,7 @@ func (s *SQLiteStore) Replace(snapshot Snapshot) error {
 	}
 	stmt, err := tx.Prepare(`
 		INSERT INTO symbol_directory
-			(source, param_kind, param_value, symbol, description, exchange, kind)
+			(source, kind, market, category, symbol, description, exchange)
 		VALUES (?, ?, ?, ?, ?, ?, ?)`)
 	if err != nil {
 		return fmt.Errorf("prepare symbol directory insert: %w", err)
@@ -137,11 +160,10 @@ func (s *SQLiteStore) Replace(snapshot Snapshot) error {
 	defer stmt.Close()
 
 	for _, item := range snapshot.Entries {
-		paramKind, paramValue, kind, err := directoryParam(item.Params)
-		if err != nil {
-			return err
-		}
-		if _, err := stmt.Exec(item.Source, paramKind, paramValue, item.Symbol, item.Description, item.Exchange, kind); err != nil {
+		if _, err := stmt.Exec(
+			item.Source, string(item.Routing.Kind), item.Routing.Market, item.Routing.Category,
+			item.Symbol, item.Description, item.Exchange,
+		); err != nil {
 			return fmt.Errorf("insert symbol %s: %w", item.Symbol, err)
 		}
 	}
@@ -155,61 +177,6 @@ func (s *SQLiteStore) Replace(snapshot Snapshot) error {
 		return fmt.Errorf("commit symbol directory replacement: %w", err)
 	}
 	return nil
-}
-
-// directoryParam 拆出 SQLite 主键用的 market|category，以及品种 kind
-func directoryParam(params map[string]any) (paramKind string, paramValue uint8, kind string, err error) {
-	if params == nil {
-		return "", 0, "", fmt.Errorf("symbol directory params are empty")
-	}
-	kind = KindStock
-	if k, ok := params["kind"].(string); ok && k != "" {
-		kind = k
-	}
-	for key, value := range params {
-		if key == "kind" {
-			continue
-		}
-		if key != "market" && key != "category" {
-			return "", 0, "", fmt.Errorf("unsupported symbol directory param %q", key)
-		}
-		v, ok := anyToUint8(value)
-		if !ok {
-			return "", 0, "", fmt.Errorf("symbol directory param %q must be uint8", key)
-		}
-		if paramKind != "" {
-			return "", 0, "", fmt.Errorf("symbol directory params must contain exactly one market/category entry")
-		}
-		paramKind, paramValue = key, v
-	}
-	if paramKind == "" {
-		return "", 0, "", fmt.Errorf("symbol directory params must contain market or category")
-	}
-	return paramKind, paramValue, kind, nil
-}
-
-func anyToUint8(v any) (uint8, bool) {
-	switch n := v.(type) {
-	case uint8:
-		return n, true
-	case int:
-		if n < 0 || n > 255 {
-			return 0, false
-		}
-		return uint8(n), true
-	case int64:
-		if n < 0 || n > 255 {
-			return 0, false
-		}
-		return uint8(n), true
-	case float64:
-		if n < 0 || n > 255 || n != float64(uint8(n)) {
-			return 0, false
-		}
-		return uint8(n), true
-	default:
-		return 0, false
-	}
 }
 
 // Close 关闭底层数据库连接。

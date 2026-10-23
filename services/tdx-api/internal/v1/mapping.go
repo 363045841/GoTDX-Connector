@@ -3,7 +3,6 @@
 package v1
 
 import (
-	"fmt"
 	"math"
 	"strings"
 	"time"
@@ -216,49 +215,9 @@ func v1AssetClass(exchange, kind string) string {
 	}
 }
 
-// v1InstrumentID 生成稳定品种 ID：gotdx:{kind}:{market|category}:{symbol}。
-func v1InstrumentID(kind string, key int, symbol string) string {
-	return fmt.Sprintf("gotdx:%s:%d:%s", kind, key, symbol)
-}
-
-// v1ProviderRefKind 读取 providerRef 中的路由 kind。
-func v1ProviderRefKind(ref map[string]any) string {
-	if ref == nil {
-		return ""
-	}
-	if kind, ok := ref["kind"].(string); ok {
-		return kind
-	}
-	return ""
-}
-
-// v1ProviderRefNumber 读取 providerRef 中的数字路由键（market/category）。
-func v1ProviderRefNumber(ref map[string]any, key string) (int, bool) {
-	if ref == nil {
-		return 0, false
-	}
-	switch v := ref[key].(type) {
-	case float64:
-		return int(v), true
-	case int:
-		return v, true
-	default:
-		return 0, false
-	}
-}
-
-// toV1Instrument 将内部搜索项映射为 V1 品种描述。
+// toV1Instrument 将目录条目映射为 V1 品种描述；ID 与 providerRef 由同一路由生成。
 func toV1Instrument(item directory.Item) v1InstrumentDescriptor {
-	kind := ""
-	key := 0
-	if params := item.Params; params != nil {
-		kind = v1ProviderRefKind(params)
-		if c, ok := v1ProviderRefNumber(params, "category"); ok {
-			key = c
-		} else if m, ok := v1ProviderRefNumber(params, "market"); ok {
-			key = m
-		}
-	}
+	kind := string(item.Routing.Kind)
 	assetClass := v1AssetClass(item.Exchange, kind)
 	caps := v1InstrumentCapabilitiesFor(kind)
 	if _, ok := futuresCalendarExchange(item.Exchange, item.Symbol); ok {
@@ -266,7 +225,7 @@ func toV1Instrument(item directory.Item) v1InstrumentDescriptor {
 		caps.TradingCalendar = &supported
 	}
 	return v1InstrumentDescriptor{
-		ID:           v1InstrumentID(kind, key, item.Symbol),
+		ID:           item.Routing.ID(v1SourceID, item.Symbol),
 		SourceID:     v1SourceID,
 		Symbol:       item.Symbol,
 		Name:         item.Description,
@@ -274,7 +233,7 @@ func toV1Instrument(item directory.Item) v1InstrumentDescriptor {
 		Exchange:     item.Exchange,
 		SessionID:    v1ExchangeToSession(item.Exchange),
 		Currency:     v1ExchangeToCurrency(item.Exchange),
-		ProviderRef:  item.Params,
+		ProviderRef:  item.Routing.ProviderRef(),
 		Capabilities: caps,
 	}
 }

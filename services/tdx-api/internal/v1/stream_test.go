@@ -15,6 +15,7 @@ import (
 	"KlineChartQuantGo/services/tdx-api/internal/client"
 	"KlineChartQuantGo/services/tdx-api/internal/directory"
 	"KlineChartQuantGo/services/tdx-api/internal/domain"
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 	"KlineChartQuantGo/services/tdx-api/internal/live"
 	"github.com/bensema/gotdx/proto"
 	"github.com/gin-gonic/gin"
@@ -68,13 +69,13 @@ func TestResolveLiveTarget(t *testing.T) {
 	cache := liveTestCache()
 	ok := []struct {
 		symbol, id, exchange string
-		want                 liveTarget
+		want                 liveSeries
 	}{
-		{"000001", "gotdx:index:1:000001", "", liveTarget{Kind: "index", Market: 1, Code: "000001"}},
-		{"gotdx:stock:0:000001", "", "", liveTarget{Kind: "stock", Market: 0, Code: "000001"}},
-		{"000001.SZ", "", "", liveTarget{Kind: "stock", Market: 0, Code: "000001"}},
-		{"000001", "", "sh", liveTarget{Kind: "index", Market: 1, Code: "000001"}},
-		{"600519", "", "", liveTarget{Kind: "stock", Market: 1, Code: "600519"}},
+		{"000001", "gotdx:index:1:000001", "", liveSeries{Routing: instrument.Routing{Kind: instrument.Index, Market: 1}, Code: "000001"}},
+		{"gotdx:stock:0:000001", "", "", liveSeries{Routing: instrument.Routing{Kind: instrument.Stock, Market: 0}, Code: "000001"}},
+		{"000001.SZ", "", "", liveSeries{Routing: instrument.Routing{Kind: instrument.Stock, Market: 0}, Code: "000001"}},
+		{"000001", "", "sh", liveSeries{Routing: instrument.Routing{Kind: instrument.Index, Market: 1}, Code: "000001"}},
+		{"600519", "", "", liveSeries{Routing: instrument.Routing{Kind: instrument.Stock, Market: 1}, Code: "600519"}},
 	}
 	for _, tc := range ok {
 		got, apiErr, _ := resolveLiveTarget(cache, tc.symbol, tc.id, tc.exchange)
@@ -83,7 +84,13 @@ func TestResolveLiveTarget(t *testing.T) {
 		}
 	}
 
-	_, apiErr, status := resolveLiveTarget(cache, "000001", "", "")
+	// 指数 000001 只存在于 market 1；market 0 的组合必须在触达上游前拒绝。
+	_, apiErr, status := resolveLiveTarget(cache, "000001", "gotdx:index:0:000001", "")
+	if apiErr == nil || status != http.StatusBadRequest || apiErr.Code != v1CodeInvalidRequest {
+		t.Fatalf("mismatched index id = %#v status=%d, want 400 INVALID_REQUEST", apiErr, status)
+	}
+
+	_, apiErr, status = resolveLiveTarget(cache, "000001", "", "")
 	if apiErr == nil || status != http.StatusBadRequest || apiErr.Details["candidates"] == nil {
 		t.Fatalf("ambiguous = %#v status=%d, want 400 with candidates", apiErr, status)
 	}
@@ -105,11 +112,11 @@ func TestResolveLiveTarget(t *testing.T) {
 type liveFakeFetch struct {
 	mu      sync.Mutex
 	bars    []live.Bar
-	targets []liveTarget
+	targets []liveSeries
 }
 
 // build 实现 liveFetchBuilder。
-func (f *liveFakeFetch) build(target liveTarget, category, adjust uint16) live.FetchFunc {
+func (f *liveFakeFetch) build(target liveSeries, category, adjust uint16) live.FetchFunc {
 	f.mu.Lock()
 	f.targets = append(f.targets, target)
 	f.mu.Unlock()
@@ -329,25 +336,27 @@ func TestV1StreamRejectsBadRequests(t *testing.T) {
 
 // 验证 gotdx 拉取函数复用 bars 接口映射（时间戳一致）、按 kind 路由并把 qfq 归一为 none。
 func TestGotdxLiveFetchMapsLikeBars(t *testing.T) {
-	originalStock, originalIndex := domain.FetchStockKLinePage, domain.FetchIndexBarsPage
-	t.Cleanup(func() {
-		domain.FetchStockKLinePage = originalStock
-		domain.FetchIndexBarsPage = originalIndex
-	})
 	loc := time.FixedZone("CST", 8*60*60)
 	bars := []proto.SecurityBar{
 		{DateTime: time.Date(2026, 10, 9, 10, 0, 0, 0, loc), Open: 10, High: 11, Low: 9, Close: 10.5, Vol: 100, Amount: 1000},
 		{DateTime: time.Date(2026, 10, 9, 10, 5, 0, 0, loc), Open: 10.5, High: 11.2, Low: 10.4, Close: 11, Vol: 50, Amount: 550},
 	}
 	var gotCount, gotAdjust uint16
-	domain.FetchStockKLinePage = func(category uint16, market uint8, code string, start, count, times, adjust uint16) ([]proto.SecurityBar, error) {
-		if category != 0 || market != 1 || code != "600519" || start != 0 {
-			t.Fatalf("StockKLine cat=%d m=%d c=%s start=%d", category, market, code, start)
-		}
-		gotCount, gotAdjust = count, adjust
-		return bars, nil
+	fetch := domain.Fetcher{
+		StockPage: func(category uint16, market uint8, code string, start, count, times, adjust uint16) ([]proto.SecurityBar, error) {
+			if category != 0 || market != 1 || code != "600519" || start != 0 {
+				t.Fatalf("StockKLine cat=%d m=%d c=%s start=%d", category, market, code, start)
+			}
+			gotCount, gotAdjust = count, adjust
+			return bars, nil
+		},
+		IndexPage: func(uint16, uint8, string, uint16, uint16) ([]proto.SecurityBar, error) {
+			return nil, nil
+		},
 	}
-	got, err := gotdxLiveFetch(liveTarget{Kind: "stock", Market: 1, Code: "600519"}, 0, 0)(context.Background())
+	got, err := gotdxLiveFetch(fetch)(liveSeries{
+		Routing: instrument.Routing{Kind: instrument.Stock, Market: 1}, Code: "600519",
+	}, 0, 0)(context.Background())
 	if err != nil || len(got) != 2 {
 		t.Fatalf("fetch = %#v %v", got, err)
 	}
@@ -359,10 +368,9 @@ func TestGotdxLiveFetchMapsLikeBars(t *testing.T) {
 		t.Fatalf("bar = %#v, want bars-endpoint mapping ts=%d", got[1], want.Timestamp)
 	}
 
-	domain.FetchIndexBarsPage = func(uint16, uint8, string, uint16, uint16) ([]proto.SecurityBar, error) {
-		return nil, nil
-	}
-	got, err = gotdxLiveFetch(liveTarget{Kind: "index", Market: 1, Code: "000001"}, 0, 0)(context.Background())
+	got, err = gotdxLiveFetch(fetch)(liveSeries{
+		Routing: instrument.Routing{Kind: instrument.Index, Market: 1}, Code: "000001",
+	}, 0, 0)(context.Background())
 	if err != nil || got != nil {
 		t.Fatalf("empty index = %#v %v, want nil,nil (no-data status)", got, err)
 	}

@@ -11,6 +11,7 @@ import (
 	"time"
 	"unicode"
 
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 	"github.com/gin-gonic/gin"
 	_ "modernc.org/sqlite"
 )
@@ -96,8 +97,10 @@ func handleV1TradingCalendar(c *gin.Context) {
 		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid source, anchor, count or instrument")
 		return
 	}
+	kind, _ := req.Instrument.ProviderRef["kind"].(string)
 	venue, ok := futuresCalendarExchange(req.Instrument.Exchange, req.Instrument.Symbol)
-	if !ok || v1ProviderRefKind(req.Instrument.ProviderRef) != "ex" || req.Period != "daily" || req.Adjustment != "none" || req.BarAggregation != "original" {
+	if kind != string(instrument.Ex) || !ok ||
+		req.Period != "daily" || req.Adjustment != "none" || req.BarAggregation != "original" {
 		writeV1Error(c, http.StatusUnprocessableEntity, v1CodeUnsupportedCapability, "trading calendar unavailable for this series")
 		return
 	}

@@ -7,11 +7,12 @@ import (
 	"testing"
 
 	"KlineChartQuantGo/services/tdx-api/internal/client"
+	"KlineChartQuantGo/services/tdx-api/internal/v1"
 )
 
 // 验证存活探针不依赖上游状态且始终成功。
 func TestLivenessAlwaysReturnsOK(t *testing.T) {
-	router := newRouterWithStatus(nil, func() client.Status { return client.Status{} })
+	router := NewRouter(v1.Deps{Status: func() client.Status { return client.Status{} }})
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health/live", nil))
 	if response.Code != http.StatusOK {
@@ -25,7 +26,7 @@ func TestReadinessReturnsServiceUnavailableWhenAnyDomainIsDown(t *testing.T) {
 		client.DomainMain: {Ready: true},
 		client.DomainEx:   {Ready: false, LastError: "unavailable"},
 	}}
-	router := newRouterWithStatus(nil, func() client.Status { return status })
+	router := NewRouter(v1.Deps{Status: func() client.Status { return status }})
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 	if response.Code != http.StatusServiceUnavailable {
@@ -40,7 +41,7 @@ func TestReadinessReturnsOKWhenAllDomainsAreReady(t *testing.T) {
 		client.DomainEx:   {Ready: true},
 		client.DomainMAC:  {Ready: true},
 	}}
-	router := newRouterWithStatus(nil, func() client.Status { return status })
+	router := NewRouter(v1.Deps{Status: func() client.Status { return status }})
 	response := httptest.NewRecorder()
 	router.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/health/ready", nil))
 	if response.Code != http.StatusOK {

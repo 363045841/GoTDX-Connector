@@ -2,12 +2,15 @@
 package directory
 
 import (
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
+
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 )
 
 // 验证SQLite符号目录存储持久化并替换快照。
@@ -25,7 +28,7 @@ func TestSQLiteSymbolDirectoryStorePersistsAndReplacesSnapshot(t *testing.T) {
 	first := Snapshot{
 		Entries: []Item{{
 			Symbol: "000001", Description: "Ping An", Exchange: "SZ", Source: "gotdx",
-			Params: map[string]any{"market": uint8(0), "kind": "stock"},
+			Routing: instrument.Routing{Kind: instrument.Stock, Market: 0},
 		}},
 		LoadedAt: time.Unix(1_700_000_000, 0).UTC(),
 	}
@@ -49,7 +52,7 @@ func TestSQLiteSymbolDirectoryStorePersistsAndReplacesSnapshot(t *testing.T) {
 	second := Snapshot{
 		Entries: []Item{{
 			Symbol: "00700", Description: "Tencent", Exchange: "HK", Source: "gotdx",
-			Params: map[string]any{"category": uint8(7), "kind": "ex"},
+			Routing: instrument.Routing{Kind: instrument.Ex, Category: 7},
 		}},
 		LoadedAt: first.LoadedAt.Add(time.Hour),
 	}
@@ -59,6 +62,42 @@ func TestSQLiteSymbolDirectoryStorePersistsAndReplacesSnapshot(t *testing.T) {
 	got, found, err = store.Load()
 	if err != nil || !found || !reflect.DeepEqual(got, second) {
 		t.Fatalf("Load() after replacement = %#v, found:%v err:%v", got, found, err)
+	}
+}
+
+// 验证旧版目录表在打开时被丢弃重建，不做数据迁移。
+func TestSQLiteSymbolDirectoryStoreDropsLegacySchema(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "symbols.db")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy database: %v", err)
+	}
+	if _, err := legacy.Exec(`
+		CREATE TABLE symbol_directory (
+			source TEXT NOT NULL,
+			param_kind TEXT NOT NULL,
+			param_value INTEGER NOT NULL,
+			symbol TEXT NOT NULL,
+			description TEXT NOT NULL,
+			exchange TEXT NOT NULL,
+			kind TEXT NOT NULL DEFAULT 'stock'
+		);
+		CREATE TABLE symbol_directory_metadata (id INTEGER PRIMARY KEY, loaded_at_unix INTEGER NOT NULL);
+		INSERT INTO symbol_directory VALUES ('gotdx', 'market', 0, '000001', 'Ping An', 'SZ', 'stock');
+		INSERT INTO symbol_directory_metadata VALUES (1, 1700000000);`); err != nil {
+		t.Fatalf("create legacy schema: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy database: %v", err)
+	}
+
+	store, err := NewSQLiteStore(path)
+	if err != nil {
+		t.Fatalf("open store on legacy database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	if _, found, err := store.Load(); err != nil || found {
+		t.Fatalf("legacy snapshot survived rebuild: found=%v err=%v", found, err)
 	}
 }
 
@@ -73,7 +112,7 @@ func TestSQLiteSymbolDirectoryStorePreservesSnapshotWhenReplacementFails(t *test
 	first := Snapshot{
 		Entries: []Item{{
 			Symbol: "000001", Description: "Ping An", Exchange: "SZ", Source: "gotdx",
-			Params: map[string]any{"market": uint8(0), "kind": "stock"},
+			Routing: instrument.Routing{Kind: instrument.Stock, Market: 0},
 		}},
 		LoadedAt: time.Unix(1_700_000_000, 0).UTC(),
 	}
@@ -92,7 +131,7 @@ func TestSQLiteSymbolDirectoryStorePreservesSnapshotWhenReplacementFails(t *test
 	failed := Snapshot{
 		Entries: []Item{{
 			Symbol: "FAIL", Description: "Failure", Exchange: "SZ", Source: "gotdx",
-			Params: map[string]any{"market": uint8(0), "kind": "stock"},
+			Routing: instrument.Routing{Kind: instrument.Stock, Market: 0},
 		}},
 		LoadedAt: first.LoadedAt.Add(time.Hour),
 	}
@@ -133,7 +172,7 @@ func TestSQLiteSymbolDirectoryStoreWaitsForConcurrentWriter(t *testing.T) {
 		done <- secondStore.Replace(Snapshot{
 			Entries: []Item{{
 				Symbol: "000001", Description: "Ping An", Exchange: "SZ", Source: "gotdx",
-				Params: map[string]any{"market": uint8(0), "kind": "stock"},
+				Routing: instrument.Routing{Kind: instrument.Stock, Market: 0},
 			}},
 			LoadedAt: time.Unix(2, 0).UTC(),
 		})
@@ -169,15 +208,15 @@ func TestSQLiteSymbolDirectoryStoreLoadsConsistentSnapshotDuringReplacement(t *t
 	snapshots := []Snapshot{
 		{
 			Entries: []Item{{
-				Symbol: "A", Description: "Version A", Exchange: "SZ", Source: "gotdx",
-				Params: map[string]any{"market": uint8(0), "kind": "stock"},
+				Symbol: "000001", Description: "Version A", Exchange: "SZ", Source: "gotdx",
+				Routing: instrument.Routing{Kind: instrument.Stock, Market: 0},
 			}},
 			LoadedAt: time.Unix(1, 0).UTC(),
 		},
 		{
 			Entries: []Item{{
-				Symbol: "B", Description: "Version B", Exchange: "SH", Source: "gotdx",
-				Params: map[string]any{"market": uint8(1), "kind": "index"},
+				Symbol: "600519", Description: "Version B", Exchange: "SH", Source: "gotdx",
+				Routing: instrument.Routing{Kind: instrument.Stock, Market: 1},
 			}},
 			LoadedAt: time.Unix(2, 0).UTC(),
 		},
@@ -214,7 +253,7 @@ func TestSQLiteSymbolDirectoryStoreLoadsConsistentSnapshotDuringReplacement(t *t
 			readErr = fmt.Errorf("invalid snapshot: %#v, found:%v", snapshot, found)
 			break
 		}
-		wantSymbol := map[int64]string{1: "A", 2: "B"}[snapshot.LoadedAt.Unix()]
+		wantSymbol := map[int64]string{1: "000001", 2: "600519"}[snapshot.LoadedAt.Unix()]
 		if snapshot.Entries[0].Symbol != wantSymbol {
 			readErr = fmt.Errorf("mixed snapshot: loadedAt:%s entry:%#v", snapshot.LoadedAt, snapshot.Entries[0])
 			break

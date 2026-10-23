@@ -45,7 +45,7 @@ func printUsage() {
 	if exe == "main" || exe == "main.exe" {
 		exe = "go run ."
 	}
-	fmt.Fprintf(os.Stderr, `KlineChartQuantGo — multi-service launcher
+	fmt.Fprintf(os.Stderr, `KlineChartQuantGo — tdx-api launcher
 
 Usage:
   %s <service>

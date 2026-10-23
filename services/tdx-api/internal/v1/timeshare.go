@@ -3,11 +3,13 @@ package v1
 
 import (
 	"errors"
+	"log"
 	"math"
 	"net/http"
 	"time"
 
 	"KlineChartQuantGo/services/tdx-api/internal/domain"
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 	"github.com/bensema/gotdx/proto"
 	"github.com/gin-gonic/gin"
 )
@@ -103,108 +105,114 @@ func v1ValidPreClose(value float64) bool {
 	return value > 0 && !math.IsNaN(value) && !math.IsInf(value, 0)
 }
 
+// writeV1UpstreamError 记录上游细节并给客户端返回稳定错误。
+func writeV1UpstreamError(c *gin.Context, err error) {
+	log.Printf("timeshare query failed: request_id=%s error=%v", requestID(c), err)
+	writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, "upstream request failed")
+}
+
 // v1StockRangeDays 以截止交易日为上界取最近 days 根日线，日线天然跳过非交易日。
-func v1StockRangeDays(market uint8, code, kind string, end time.Time, days int) ([]proto.SecurityBar, error) {
+func v1StockRangeDays(fetch domain.Fetcher, market uint8, code, kind string, end time.Time, days int) ([]proto.SecurityBar, error) {
 	before := end.AddDate(0, 0, 1)
 	if domain.IsIndexKind(kind, market, code) {
-		return domain.IndexKLineBefore(4, market, code, days, &before)
+		return domain.IndexKLineBefore(fetch, 4, market, code, days, &before)
 	}
-	return domain.StockKLineBefore(4, market, code, 1, 0, days, &before)
+	return domain.StockKLineBefore(fetch, 4, market, code, 1, 0, days, &before)
 }
 
 // v1ExRangeDays 以截止交易日为上界取最近 days 根扩展行情日线。
-func v1ExRangeDays(category uint8, code string, end time.Time, days int) ([]proto.ExKLineItem, error) {
+func v1ExRangeDays(fetch domain.Fetcher, category uint8, code string, end time.Time, days int) ([]proto.ExKLineItem, error) {
 	before := end.AddDate(0, 0, 1)
-	return domain.ExKLineBefore(category, code, 4, 1, days, &before)
+	return domain.ExKLineBefore(fetch, category, code, 4, 1, days, &before)
 }
 
 // handleV1TimeShareRange 拉取指定品种最近多个实际交易日的分时序列。
-func handleV1TimeShareRange(c *gin.Context) {
-	var req v1TimeShareRangeRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid JSON: "+err.Error())
-		return
-	}
-	if req.Days < 1 || req.Days > v1MaxTimeShareRangeDays {
-		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "days must be between 1 and 20")
-		return
-	}
-	end, err := v1TradingDateTime(req.EndTradingDate)
-	if err != nil {
-		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid endTradingDate: "+err.Error())
-		return
-	}
-
-	ref := req.Instrument.ProviderRef
-	timezone := v1ExchangeToTimezone(req.Instrument.Exchange)
-	days := make([]v1TimeShareDay, 0, req.Days)
-	if v1ProviderRefKind(ref) == domain.KindEx {
-		category, ok := v1ProviderRefNumber(ref, "category")
-		if !ok {
-			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "providerRef.category is required for ex")
+func handleV1TimeShareRange(fetch domain.Fetcher) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req v1TimeShareRangeRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid JSON: "+err.Error())
 			return
 		}
-		bars, err := v1ExRangeDays(uint8(category), req.Instrument.Symbol, end, req.Days)
+		if req.SourceID != "" && req.SourceID != v1SourceID {
+			writeV1Error(c, http.StatusNotFound, v1CodeInvalidRequest, "unknown sourceId "+req.SourceID)
+			return
+		}
+		if req.Days < 1 || req.Days > v1MaxTimeShareRangeDays {
+			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "days must be between 1 and 20")
+			return
+		}
+		end, err := v1TradingDateTime(req.EndTradingDate)
 		if err != nil {
-			writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
+			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid endTradingDate: "+err.Error())
 			return
 		}
-		for _, bar := range bars {
-			preClose := domain.ExKLinePreClose(bar)
-			if !v1ValidPreClose(preClose) {
-				writeV1Error(c, http.StatusBadGateway, v1CodeInvalidResponse, "invalid historical preClose")
-				return
-			}
-			date := uint32(bar.DateTime.Year()*10000 + int(bar.DateTime.Month())*100 + bar.DateTime.Day())
-			points, err := domain.BuildExTimeSharePoints(
-				domain.ExTimeShareRequest{Date: date, Category: uint8(category), Code: req.Instrument.Symbol},
-				domain.FetchExHistoryTick,
-			)
+		resolved, apiErr, status := resolveInstrument(req.Instrument, nil)
+		if apiErr != nil {
+			writeV1APIError(c, apiErr, status)
+			return
+		}
+		timezone := v1ExchangeToTimezone(resolved.Exchange)
+		days := make([]v1TimeShareDay, 0, req.Days)
+		if resolved.Routing.Kind == instrument.Ex {
+			bars, err := v1ExRangeDays(fetch, resolved.Routing.Category, resolved.Symbol, end, req.Days)
 			if err != nil {
-				writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
+				writeV1UpstreamError(c, err)
 				return
 			}
-			days = append(days, v1TimeShareDay{TradingDate: bar.DateTime.Format("2006-01-02"), PreClose: preClose, Items: v1TimeShareItems(points)})
-		}
-	} else {
-		market, ok := v1ProviderRefNumber(ref, "market")
-		if !ok {
-			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "providerRef.market is required")
-			return
-		}
-		kind := v1ProviderRefKind(ref)
-		bars, err := v1StockRangeDays(uint8(market), req.Instrument.Symbol, kind, end, req.Days)
-		if err != nil {
-			writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
-			return
-		}
-		for _, bar := range bars {
-			preClose := domain.SecurityBarPreClose(bar)
-			if !v1ValidPreClose(preClose) {
-				writeV1Error(c, http.StatusBadGateway, v1CodeInvalidResponse, "invalid historical preClose")
-				return
+			for _, bar := range bars {
+				preClose := domain.ExKLinePreClose(bar)
+				if !v1ValidPreClose(preClose) {
+					writeV1Error(c, http.StatusBadGateway, v1CodeInvalidResponse, "invalid historical preClose")
+					return
+				}
+				date := uint32(bar.DateTime.Year()*10000 + int(bar.DateTime.Month())*100 + bar.DateTime.Day())
+				points, err := domain.BuildExTimeSharePoints(
+					domain.ExTimeShareRequest{Date: date, Category: resolved.Routing.Category, Code: resolved.Symbol},
+					fetch.ExTick,
+				)
+				if err != nil {
+					writeV1UpstreamError(c, err)
+					return
+				}
+				days = append(days, v1TimeShareDay{TradingDate: bar.DateTime.Format("2006-01-02"), PreClose: preClose, Items: v1TimeShareItems(points)})
 			}
-			date := uint32(bar.DateTime.Year()*10000 + int(bar.DateTime.Month())*100 + bar.DateTime.Day())
-			points, err := domain.BuildStockTimeSharePoints(
-				domain.StockTimeShareRequest{Date: date, Market: uint8(market), Code: req.Instrument.Symbol, Kind: kind},
-				domain.FetchStockHistoryTick,
-				time.Now,
-			)
+		} else {
+			kind := string(resolved.Routing.Kind)
+			bars, err := v1StockRangeDays(fetch, resolved.Routing.Market, resolved.Symbol, kind, end, req.Days)
 			if err != nil {
-				writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
+				writeV1UpstreamError(c, err)
 				return
 			}
-			days = append(days, v1TimeShareDay{TradingDate: bar.DateTime.Format("2006-01-02"), PreClose: preClose, Items: v1TimeShareItems(points)})
+			for _, bar := range bars {
+				preClose := domain.SecurityBarPreClose(bar)
+				if !v1ValidPreClose(preClose) {
+					writeV1Error(c, http.StatusBadGateway, v1CodeInvalidResponse, "invalid historical preClose")
+					return
+				}
+				date := uint32(bar.DateTime.Year()*10000 + int(bar.DateTime.Month())*100 + bar.DateTime.Day())
+				points, err := domain.BuildStockTimeSharePoints(
+					domain.StockTimeShareRequest{Date: date, Market: resolved.Routing.Market, Code: resolved.Symbol, Kind: kind},
+					fetch.StockTick,
+					fetch.OpeningTrade,
+					time.Now,
+				)
+				if err != nil {
+					writeV1UpstreamError(c, err)
+					return
+				}
+				days = append(days, v1TimeShareDay{TradingDate: bar.DateTime.Format("2006-01-02"), PreClose: preClose, Items: v1TimeShareItems(points)})
+			}
 		}
-	}
 
-	writeV1Data(c, http.StatusOK, v1TimeShareRangeSeries{
-		InstrumentID:  req.Instrument.ID,
-		Timezone:      timezone,
-		RequestedDays: req.Days,
-		Days:          days,
-		OlderData:     v1TimeShareRangeOlderData(len(days), req.Days),
-	})
+		writeV1Data(c, http.StatusOK, v1TimeShareRangeSeries{
+			InstrumentID:  resolved.ID,
+			Timezone:      timezone,
+			RequestedDays: req.Days,
+			Days:          days,
+			OlderData:     v1TimeShareRangeOlderData(len(days), req.Days),
+		})
+	}
 }
 
 // v1TimeShareRangeOlderData 声明历史日线不足请求天数时已到达可用历史边界。
@@ -216,77 +224,78 @@ func v1TimeShareRangeOlderData(returnedDays, requestedDays int) string {
 }
 
 // handleV1Timeshare 拉取指定品种在单个交易日内的分时序列。
-func handleV1Timeshare(c *gin.Context) {
-	var req v1TimeShareRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid JSON: "+err.Error())
-		return
-	}
-	date, err := v1ParseTradingDate(req.TradingDate)
-	if err != nil {
-		writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid tradingDate: "+err.Error())
-		return
-	}
-	timezone := v1ExchangeToTimezone(req.Instrument.Exchange)
-	ref := req.Instrument.ProviderRef
-
-	var points []domain.TimeSharePoint
-	var preClose float64
-	switch v1ProviderRefKind(ref) {
-	case domain.KindEx:
-		cat, ok := v1ProviderRefNumber(ref, "category")
-		if !ok {
-			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "providerRef.category is required for ex")
+func handleV1Timeshare(fetch domain.Fetcher) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		var req v1TimeShareRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid JSON: "+err.Error())
 			return
 		}
-		points, err = domain.BuildExTimeSharePoints(
-			domain.ExTimeShareRequest{Date: date, Category: uint8(cat), Code: req.Instrument.Symbol},
-			domain.FetchExHistoryTick,
-		)
+		if req.SourceID != "" && req.SourceID != v1SourceID {
+			writeV1Error(c, http.StatusNotFound, v1CodeInvalidRequest, "unknown sourceId "+req.SourceID)
+			return
+		}
+		date, err := v1ParseTradingDate(req.TradingDate)
 		if err != nil {
-			if errors.Is(err, domain.ErrNoTimeShareData) {
-				writeV1Error(c, http.StatusNotFound, v1CodeInstrumentNotFound, err.Error())
-			} else {
-				writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
+			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "invalid tradingDate: "+err.Error())
+			return
+		}
+		resolved, apiErr, status := resolveInstrument(req.Instrument, nil)
+		if apiErr != nil {
+			writeV1APIError(c, apiErr, status)
+			return
+		}
+		timezone := v1ExchangeToTimezone(resolved.Exchange)
+
+		var points []domain.TimeSharePoint
+		var preClose float64
+		switch resolved.Routing.Kind {
+		case instrument.Ex:
+			points, err = domain.BuildExTimeSharePoints(
+				domain.ExTimeShareRequest{Date: date, Category: resolved.Routing.Category, Code: resolved.Symbol},
+				fetch.ExTick,
+			)
+			if err != nil {
+				if errors.Is(err, domain.ErrNoTimeShareData) {
+					writeV1Error(c, http.StatusNotFound, v1CodeInstrumentNotFound, "no timeshare data for the date")
+				} else {
+					writeV1UpstreamError(c, err)
+				}
+				return
 			}
-			return
+			preClose, err = domain.ResolveExPreClose(
+				resolved.Routing.Category, resolved.Symbol, date, domain.NewExPreCloseSource(fetch),
+			)
+			if err != nil {
+				writeV1UpstreamError(c, err)
+				return
+			}
+		default:
+			stockReq := domain.StockTimeShareRequest{
+				Date: date, Market: resolved.Routing.Market, Code: resolved.Symbol, Kind: string(resolved.Routing.Kind),
+			}
+			points, err = domain.BuildStockTimeSharePoints(stockReq, fetch.StockTick, fetch.OpeningTrade, time.Now)
+			if err != nil {
+				writeV1UpstreamError(c, err)
+				return
+			}
+			isIndex := resolved.Routing.Kind == instrument.Index
+			preClose, err = domain.ResolveStockPreClose(
+				resolved.Routing.Market, resolved.Symbol, date,
+				domain.NewStockPreCloseSource(fetch, resolved.Routing.Market, resolved.Symbol, isIndex),
+			)
+			if err != nil {
+				writeV1UpstreamError(c, err)
+				return
+			}
 		}
-		preClose, err = domain.ResolveExPreClose(uint8(cat), req.Instrument.Symbol, date, domain.NewDefaultExPreCloseSource())
-		if err != nil {
-			writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
-			return
-		}
-	default:
-		market, ok := v1ProviderRefNumber(ref, "market")
-		if !ok {
-			writeV1Error(c, http.StatusBadRequest, v1CodeInvalidRequest, "providerRef.market is required")
-			return
-		}
-		kind := v1ProviderRefKind(ref)
-		stockReq := domain.StockTimeShareRequest{
-			Date: date, Market: uint8(market), Code: req.Instrument.Symbol, Kind: kind,
-		}
-		points, err = domain.BuildStockTimeSharePoints(stockReq, domain.FetchStockHistoryTick, time.Now)
-		if err != nil {
-			writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
-			return
-		}
-		isIndex := domain.IsIndexKind(kind, uint8(market), req.Instrument.Symbol)
-		preClose, err = domain.ResolveStockPreClose(
-			uint8(market), req.Instrument.Symbol, date,
-			domain.NormalizeStockPreCloseSource(domain.NewDefaultStockPreCloseSource(), stockReq, isIndex),
-		)
-		if err != nil {
-			writeV1Error(c, http.StatusBadGateway, v1CodeUpstreamUnavailable, err.Error())
-			return
-		}
-	}
 
-	writeV1Data(c, http.StatusOK, v1TimeShareSeries{
-		InstrumentID: req.Instrument.ID,
-		TradingDate:  req.TradingDate,
-		Timezone:     timezone,
-		PreClose:     preClose,
-		Items:        v1TimeShareItems(points),
-	})
+		writeV1Data(c, http.StatusOK, v1TimeShareSeries{
+			InstrumentID: resolved.ID,
+			TradingDate:  req.TradingDate,
+			Timezone:     timezone,
+			PreClose:     preClose,
+			Items:        v1TimeShareItems(points),
+		})
+	}
 }

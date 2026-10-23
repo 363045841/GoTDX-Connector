@@ -34,10 +34,16 @@ func (l *fakeDirectoryLoader) ExList(uint32, uint16) ([]proto.ExListItem, error)
 	return nil, nil
 }
 
-func newV1TestRouter(cache *directory.Cache, status func() client.Status) *gin.Engine {
+// newV1TestRouter 构造注入了拉取替身的路由；未传替身时使用零值 Fetcher。
+func newV1TestRouter(cache *directory.Cache, status func() client.Status, fetchers ...domain.Fetcher) *gin.Engine {
+	fetch := domain.Fetcher{}
+	if len(fetchers) > 0 {
+		fetch = fetchers[0]
+	}
 	gin.SetMode(gin.TestMode)
 	router := gin.New()
-	RegisterRoutes(router, cache, status)
+	router.Use(RequestIDMiddleware())
+	RegisterRoutes(router, Deps{Fetch: fetch, Cache: cache, Status: status})
 	return router
 }
 
@@ -161,11 +167,31 @@ type errV1ProbeDown struct{}
 
 func (e *errV1ProbeDown) Error() string { return "heartbeat refused" }
 
-// 验证品种搜索映射为 V1 品种描述并包装在 envelope 中。
+// v1SearchItem 搜索响应的测试视图。
+type v1SearchItem struct {
+	ID           string         `json:"id"`
+	SourceID     string         `json:"sourceId"`
+	Symbol       string         `json:"symbol"`
+	Name         string         `json:"name"`
+	AssetClass   string         `json:"assetClass"`
+	Exchange     string         `json:"exchange"`
+	SessionID    string         `json:"sessionId"`
+	ProviderRef  map[string]any `json:"providerRef"`
+	Capabilities struct {
+		Bars struct {
+			Periods     []string `json:"periods"`
+			Adjustments []string `json:"adjustments"`
+		} `json:"bars"`
+		TimeShare bool `json:"timeShare"`
+	} `json:"capabilities"`
+}
+
+// 验证品种搜索为同码股票与指数生成各自规范 ID，ID 与 providerRef 同源。
 func TestV1SearchMapsInstruments(t *testing.T) {
 	loader := &fakeDirectoryLoader{
 		stocks: map[uint8][]proto.Security{
 			0: {{Code: "000001", Name: "平安银行"}},
+			1: {{Code: "000001", Name: "上证指数"}},
 		},
 	}
 	cache := directory.NewCache(loader, nil, 24*time.Hour)
@@ -176,40 +202,52 @@ func TestV1SearchMapsInstruments(t *testing.T) {
 
 	var body struct {
 		Data struct {
-			Items []struct {
-				ID           string `json:"id"`
-				SourceID     string `json:"sourceId"`
-				Symbol       string `json:"symbol"`
-				Name         string `json:"name"`
-				AssetClass   string `json:"assetClass"`
-				Exchange     string `json:"exchange"`
-				SessionID    string `json:"sessionId"`
-				Capabilities struct {
-					Bars struct {
-						Periods     []string `json:"periods"`
-						Adjustments []string `json:"adjustments"`
-					} `json:"bars"`
-					TimeShare bool `json:"timeShare"`
-				} `json:"capabilities"`
-			} `json:"items"`
+			Items []v1SearchItem `json:"items"`
 		} `json:"data"`
 		RequestID string `json:"requestId"`
 	}
 	if err := json.Unmarshal(resp.Body.Bytes(), &body); err != nil {
 		t.Fatalf("decode: %v body=%s", err, resp.Body.String())
 	}
-	if len(body.Data.Items) != 1 || body.RequestID == "" {
-		t.Fatalf("items = %#v requestId=%q, want one", body.Data.Items, body.RequestID)
+	if len(body.Data.Items) != 2 || body.RequestID == "" {
+		t.Fatalf("items = %#v requestId=%q, want two", body.Data.Items, body.RequestID)
 	}
-	item := body.Data.Items[0]
-	if item.ID != "gotdx:stock:0:000001" || item.AssetClass != "stock" || item.SessionID != "CN" {
-		t.Fatalf("item = %#v, want gotdx:stock:0:000001 stock CN", item)
+	var stock, index *v1SearchItem
+	for i := range body.Data.Items {
+		switch body.Data.Items[i].ID {
+		case "gotdx:stock:0:000001":
+			stock = &body.Data.Items[i]
+		case "gotdx:index:1:000001":
+			index = &body.Data.Items[i]
+		}
 	}
-	if len(item.Capabilities.Bars.Periods) != 10 {
-		t.Fatalf("periods = %v, want 10 standard periods", item.Capabilities.Bars.Periods)
+	if stock == nil || index == nil {
+		t.Fatalf("items = %#v, want gotdx:stock:0:000001 and gotdx:index:1:000001", body.Data.Items)
 	}
-	if len(item.Capabilities.Bars.Adjustments) != 3 || item.Capabilities.Bars.Adjustments[2] != "none" {
-		t.Fatalf("adjustments = %v, want qfq/hfq/none", item.Capabilities.Bars.Adjustments)
+	if stock.AssetClass != "stock" || stock.SessionID != "CN" || stock.Exchange != "SZ" {
+		t.Fatalf("stock = %#v, want stock CN SZ", stock)
+	}
+	if index.AssetClass != "index" || index.Exchange != "SH" {
+		t.Fatalf("index = %#v, want index SH", index)
+	}
+	if index.ProviderRef["kind"] != "index" || index.ProviderRef["market"] != float64(1) {
+		t.Fatalf("index providerRef = %#v, want index market 1", index.ProviderRef)
+	}
+	if len(stock.Capabilities.Bars.Periods) != 10 {
+		t.Fatalf("periods = %v, want 10 standard periods", stock.Capabilities.Bars.Periods)
+	}
+	if len(stock.Capabilities.Bars.Adjustments) != 3 || stock.Capabilities.Bars.Adjustments[2] != "none" {
+		t.Fatalf("adjustments = %v, want qfq/hfq/none", stock.Capabilities.Bars.Adjustments)
+	}
+}
+
+// 验证 instrumentId 与 providerRef 路由互相矛盾时拒绝请求，不回落到任意一方。
+func TestV1BarsRejectsRoutingMismatch(t *testing.T) {
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
+		`{"sourceId":"gotdx","instrument":{"id":"gotdx:index:0:000001","symbol":"000001","exchange":"SH","providerRef":{"market":1,"kind":"index"}},"period":"daily","adjustment":"none","limit":1}`)
+	if resp.Code != http.StatusBadRequest || !bytes.Contains(resp.Body.Bytes(), []byte(`"code":"INVALID_REQUEST"`)) {
+		t.Fatalf("response = %d %s, want 400 INVALID_REQUEST", resp.Code, resp.Body.String())
 	}
 }
 
@@ -226,11 +264,9 @@ func TestV1SearchRejectsEmptyKeyword(t *testing.T) {
 
 // 验证股票 K 线请求按 kind=stock 路由、映射复权参数并输出 V1 条目。
 func TestV1BarsStock(t *testing.T) {
-	original := domain.FetchStockKLinePage
-	t.Cleanup(func() { domain.FetchStockKLinePage = original })
 	loc := time.FixedZone("CST", 8*60*60)
 	day := time.Date(2026, 7, 24, 15, 0, 0, 0, loc)
-	domain.FetchStockKLinePage = func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
+	fetch := domain.Fetcher{StockPage: func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
 		if category != 4 || market != 1 || code != "600519" || times != 1 || adjust != 1 {
 			t.Fatalf("StockKLine = cat=%d m=%d c=%s times=%d adjust=%d", category, market, code, times, adjust)
 		}
@@ -239,9 +275,9 @@ func TestV1BarsStock(t *testing.T) {
 			return nil, nil
 		}
 		return []proto.SecurityBar{{DateTime: day, Open: 10, High: 11, Low: 9, Close: 10.5, Vol: 1000, Amount: 500000, RisePrice: 0.5, RiseRate: 5}}, nil
-	}
+	}}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"qfq","limit":1}`)
 
@@ -279,14 +315,12 @@ func TestV1BarsStock(t *testing.T) {
 
 // 验证 before 为排他 UTC 毫秒游标，返回最新匹配页且条目保持时间升序。
 func TestV1BarsStockBeforeCursor(t *testing.T) {
-	original := domain.FetchStockKLinePage
-	t.Cleanup(func() { domain.FetchStockKLinePage = original })
 	loc := time.FixedZone("CST", 8*60*60)
 	newest := time.Date(2026, 7, 26, 15, 0, 0, 0, loc)
 	cursor := time.Date(2026, 7, 25, 15, 0, 0, 0, loc)
 	older := time.Date(2026, 7, 24, 15, 0, 0, 0, loc)
 	oldest := time.Date(2026, 7, 23, 15, 0, 0, 0, loc)
-	domain.FetchStockKLinePage = func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
+	fetch := domain.Fetcher{StockPage: func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
 		switch start {
 		case 0:
 			return []proto.SecurityBar{{DateTime: newest}, {DateTime: cursor}}, nil
@@ -295,9 +329,9 @@ func TestV1BarsStockBeforeCursor(t *testing.T) {
 		default:
 			return nil, nil
 		}
-	}
+	}}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none","limit":2,"beforeTimestamp":`+strconv.FormatInt(cursor.UnixMilli(), 10)+`}`)
 
@@ -318,11 +352,9 @@ func TestV1BarsStockBeforeCursor(t *testing.T) {
 
 // 验证指数 K 线请求按 kind=index 路由到指数接口。
 func TestV1BarsIndex(t *testing.T) {
-	original := domain.FetchIndexBarsPage
-	t.Cleanup(func() { domain.FetchIndexBarsPage = original })
 	loc := time.FixedZone("CST", 8*60*60)
 	day := time.Date(2026, 7, 24, 15, 0, 0, 0, loc)
-	domain.FetchIndexBarsPage = func(category uint16, market uint8, code string, start, count uint16) ([]proto.SecurityBar, error) {
+	fetch := domain.Fetcher{IndexPage: func(category uint16, market uint8, code string, start, count uint16) ([]proto.SecurityBar, error) {
 		if category != 4 || market != 1 || code != "000001" {
 			t.Fatalf("GetIndexBars = cat=%d m=%d c=%s", category, market, code)
 		}
@@ -331,9 +363,9 @@ func TestV1BarsIndex(t *testing.T) {
 			return nil, nil
 		}
 		return []proto.SecurityBar{{DateTime: day, Open: 3500, High: 3510, Low: 3490, Close: 3505, Vol: 1}}, nil
-	}
+	}}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:index:1:000001","symbol":"000001","exchange":"SH","providerRef":{"market":1,"kind":"index"}},"period":"daily","adjustment":"none","limit":1}`)
 
@@ -344,22 +376,20 @@ func TestV1BarsIndex(t *testing.T) {
 
 // 验证扩展行情 K 线请求按 kind=ex 路由到扩展接口。
 func TestV1BarsEx(t *testing.T) {
-	original := domain.FetchExKLinePage
-	t.Cleanup(func() { domain.FetchExKLinePage = original })
 	loc := time.FixedZone("CST", 8*60*60)
 	day := time.Date(2026, 7, 24, 15, 0, 0, 0, loc)
-	domain.FetchExKLinePage = func(category uint8, code string, period uint16, start uint32, count uint16, times uint16) ([]proto.ExKLineItem, error) {
+	fetch := domain.Fetcher{ExPage: func(category uint8, code string, period uint16, start uint32, count uint16, times uint16) ([]proto.ExKLineItem, error) {
 		if category != 31 || code != "HSI" || period != 4 {
 			t.Fatalf("ExKLine = cat=%d c=%s period=%d", category, code, period)
 		}
-		// 首页返回单根 K 线，后续页为空，模拟真实 safeExKLine 的翻页终止行为
+		// 首页返回单根 K 线，后续页为空，模拟真实翻页终止行为
 		if start > 0 {
 			return nil, nil
 		}
 		return []proto.ExKLineItem{{DateTime: day, Open: 18000, High: 18100, Low: 17900, Close: 18050, Vol: 100, Amount: 200000}}, nil
-	}
+	}}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:ex:31:HSI","symbol":"HSI","exchange":"HK","providerRef":{"category":31,"kind":"ex"}},"period":"daily","adjustment":"none","limit":1}`)
 
@@ -395,13 +425,11 @@ func TestV1BarsRejectsUnknownPeriod(t *testing.T) {
 
 // 验证无数据品种（如已到期期货）返回 INSTRUMENT_NOT_FOUND，触发前端请求流转。
 func TestV1BarsNoDataReturnsInstrumentNotFound(t *testing.T) {
-	original := domain.FetchStockKLinePage
-	t.Cleanup(func() { domain.FetchStockKLinePage = original })
-	domain.FetchStockKLinePage = func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
+	fetch := domain.Fetcher{StockPage: func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
 		return nil, nil
-	}
+	}}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none","limit":1}`)
 
@@ -415,13 +443,11 @@ func TestV1BarsNoDataReturnsInstrumentNotFound(t *testing.T) {
 
 // 验证已有 K 线后的游标耗尽是成功空页，不会被前端误判为加载失败。
 func TestV1BarsCursorExhaustedReturnsSuccess(t *testing.T) {
-	original := domain.FetchStockKLinePage
-	t.Cleanup(func() { domain.FetchStockKLinePage = original })
-	domain.FetchStockKLinePage = func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
+	fetch := domain.Fetcher{StockPage: func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
 		return nil, nil
-	}
+	}}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/bars",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"period":"daily","adjustment":"none","limit":1,"beforeTimestamp":1}`)
 
@@ -458,26 +484,20 @@ func TestV1BarsRejectsInvalidLimit(t *testing.T) {
 
 // 验证股票分时输出 unix 毫秒点与昨收。
 func TestV1TimeShareStock(t *testing.T) {
-	originalTick := domain.FetchStockHistoryTick
-	originalOpening := domain.FetchOpeningTrade
-	originalK := domain.FetchStockKLinePage
-	t.Cleanup(func() {
-		domain.FetchStockHistoryTick = originalTick
-		domain.FetchOpeningTrade = originalOpening
-		domain.FetchStockKLinePage = originalK
-	})
 	loc := time.FixedZone("CST", 8*60*60)
-	domain.FetchStockHistoryTick = func(date uint32, market uint8, code string) ([]proto.HistoryMinuteTimeData, error) {
-		return []proto.HistoryMinuteTimeData{{Price: 8.5, Avg: 8.5, Vol: 100}}, nil
-	}
-	domain.FetchOpeningTrade = func(uint32, uint8, string, time.Time) (domain.OpeningTrade, bool) {
-		return domain.OpeningTrade{}, false
-	}
-	domain.FetchStockKLinePage = func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
-		return []proto.SecurityBar{{DateTime: time.Date(2026, 7, 24, 15, 0, 0, 0, loc), PreClose: 8.4}}, nil
+	fetch := domain.Fetcher{
+		StockTick: func(date uint32, market uint8, code string) ([]proto.HistoryMinuteTimeData, error) {
+			return []proto.HistoryMinuteTimeData{{Price: 8.5, Avg: 8.5, Vol: 100}}, nil
+		},
+		OpeningTrade: func(uint32, uint8, string, time.Time) (domain.OpeningTrade, bool) {
+			return domain.OpeningTrade{}, false
+		},
+		StockPage: func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
+			return []proto.SecurityBar{{DateTime: time.Date(2026, 7, 24, 15, 0, 0, 0, loc), PreClose: 8.4}}, nil
+		},
 	}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/timeshare",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"tradingDate":"2026-07-24"}`)
 
@@ -514,34 +534,28 @@ func TestV1TimeShareStock(t *testing.T) {
 
 // 验证多日分时按最近实际交易日聚合，并为每个交易日保留独立昨收。
 func TestV1TimeShareRangeStock(t *testing.T) {
-	originalTick := domain.FetchStockHistoryTick
-	originalOpening := domain.FetchOpeningTrade
-	originalK := domain.FetchStockKLinePage
-	t.Cleanup(func() {
-		domain.FetchStockHistoryTick = originalTick
-		domain.FetchOpeningTrade = originalOpening
-		domain.FetchStockKLinePage = originalK
-	})
 	loc := time.FixedZone("CST", 8*60*60)
 	day1 := time.Date(2026, 7, 23, 15, 0, 0, 0, loc)
 	day2 := time.Date(2026, 7, 24, 15, 0, 0, 0, loc)
-	domain.FetchStockKLinePage = func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
-		return []proto.SecurityBar{
-			{DateTime: day2, PreClose: 8.5},
-			{DateTime: day1, PreClose: 8.4},
-		}, nil
-	}
-	domain.FetchStockHistoryTick = func(date uint32, market uint8, code string) ([]proto.HistoryMinuteTimeData, error) {
-		if market != 1 || code != "600519" {
-			t.Fatalf("history tick request = date=%d market=%d code=%s", date, market, code)
-		}
-		return []proto.HistoryMinuteTimeData{{Price: float64(date), Avg: float64(date), Vol: 100}}, nil
-	}
-	domain.FetchOpeningTrade = func(uint32, uint8, string, time.Time) (domain.OpeningTrade, bool) {
-		return domain.OpeningTrade{}, false
+	fetch := domain.Fetcher{
+		StockPage: func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
+			return []proto.SecurityBar{
+				{DateTime: day2, PreClose: 8.5},
+				{DateTime: day1, PreClose: 8.4},
+			}, nil
+		},
+		StockTick: func(date uint32, market uint8, code string) ([]proto.HistoryMinuteTimeData, error) {
+			if market != 1 || code != "600519" {
+				t.Fatalf("history tick request = date=%d market=%d code=%s", date, market, code)
+			}
+			return []proto.HistoryMinuteTimeData{{Price: float64(date), Avg: float64(date), Vol: 100}}, nil
+		},
+		OpeningTrade: func(uint32, uint8, string, time.Time) (domain.OpeningTrade, bool) {
+			return domain.OpeningTrade{}, false
+		},
 	}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/timeshare/range",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:stock:1:600519","symbol":"600519","exchange":"SH","providerRef":{"market":1,"kind":"stock"}},"endTradingDate":"2026-07-26","days":2}`)
 
@@ -586,21 +600,17 @@ func TestV1TimeShareRangeRejectsInvalidDays(t *testing.T) {
 
 // 验证扩展行情分时输出点与昨收。
 func TestV1TimeShareEx(t *testing.T) {
-	originalTick := domain.FetchExHistoryTick
-	originalK := domain.FetchExKLinePage
-	t.Cleanup(func() {
-		domain.FetchExHistoryTick = originalTick
-		domain.FetchExKLinePage = originalK
-	})
 	loc := time.FixedZone("CST", 8*60*60)
-	domain.FetchExHistoryTick = func(date uint32, category uint8, code string) ([]proto.ExTickChartData, error) {
-		return []proto.ExTickChartData{{Time: "09:31", Price: 10.5, Avg: 10.5, Vol: 100}}, nil
-	}
-	domain.FetchExKLinePage = func(category uint8, code string, period uint16, start uint32, count uint16, times uint16) ([]proto.ExKLineItem, error) {
-		return []proto.ExKLineItem{{DateTime: time.Date(2026, 7, 24, 15, 0, 0, 0, loc), PreClose: 10.4}}, nil
+	fetch := domain.Fetcher{
+		ExTick: func(date uint32, category uint8, code string) ([]proto.ExTickChartData, error) {
+			return []proto.ExTickChartData{{Time: "09:31", Price: 10.5, Avg: 10.5, Vol: 100}}, nil
+		},
+		ExPage: func(category uint8, code string, period uint16, start uint32, count uint16, times uint16) ([]proto.ExKLineItem, error) {
+			return []proto.ExKLineItem{{DateTime: time.Date(2026, 7, 24, 15, 0, 0, 0, loc), PreClose: 10.4}}, nil
+		},
 	}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/timeshare",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:ex:31:HSI","symbol":"HSI","exchange":"HK","providerRef":{"category":31,"kind":"ex"}},"tradingDate":"2026-07-24"}`)
 
@@ -625,13 +635,11 @@ func TestV1TimeShareEx(t *testing.T) {
 
 // 验证扩展行情分时无数据时返回 INSTRUMENT_NOT_FOUND。
 func TestV1TimeShareExNoData(t *testing.T) {
-	originalTick := domain.FetchExHistoryTick
-	t.Cleanup(func() { domain.FetchExHistoryTick = originalTick })
-	domain.FetchExHistoryTick = func(uint32, uint8, string) ([]proto.ExTickChartData, error) {
+	fetch := domain.Fetcher{ExTick: func(uint32, uint8, string) ([]proto.ExTickChartData, error) {
 		return []proto.ExTickChartData{{Time: "09:31", Price: 0, Avg: 0, Vol: 0}}, nil
-	}
+	}}
 
-	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} })
+	router := newV1TestRouter(nil, func() client.Status { return client.Status{Ready: true} }, fetch)
 	resp := v1Request(router, http.MethodPost, "/api/v1/market-data/timeshare",
 		`{"sourceId":"gotdx","instrument":{"id":"gotdx:ex:31:HSI","symbol":"HSI","exchange":"HK","providerRef":{"category":31,"kind":"ex"}},"tradingDate":"2026-07-24"}`)
 

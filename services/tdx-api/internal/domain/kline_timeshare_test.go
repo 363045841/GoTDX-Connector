@@ -208,9 +208,6 @@ func TestResolveExPreCloseUsesTargetDailyBarForHistoricalDate(t *testing.T) {
 
 // 验证新三板、基金和 REITs 日K透传对应复权参数。
 func TestStockKLineRangePassesAdjustForSpecifiedSecurityTypes(t *testing.T) {
-	previous := FetchStockKLinePage
-	t.Cleanup(func() { FetchStockKLinePage = previous })
-
 	loc := time.FixedZone("CST", 8*60*60)
 	startDate := time.Date(2026, 7, 24, 0, 0, 0, 0, loc)
 	endDate := startDate
@@ -229,14 +226,14 @@ func TestStockKLineRangePassesAdjustForSpecifiedSecurityTypes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			FetchStockKLinePage = func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
+			fetch := Fetcher{StockPage: func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
 				if category != 4 || market != 1 || code != tt.code || times != 1 || adjust != tt.adjust {
 					t.Fatalf("StockKLine request = category=%d market=%d code=%s times=%d adjust=%d", category, market, code, times, adjust)
 				}
 				return []proto.SecurityBar{{DateTime: startDate, Close: 10}}, nil
-			}
+			}}
 
-			bars, err := StockKLineRange(4, 1, tt.code, 1, tt.adjust, startDate, endDate)
+			bars, err := StockKLineRange(fetch, 4, 1, tt.code, 1, tt.adjust, startDate, endDate)
 			if err != nil {
 				t.Fatalf("StockKLineRange: %v", err)
 			}
@@ -249,9 +246,6 @@ func TestStockKLineRangePassesAdjustForSpecifiedSecurityTypes(t *testing.T) {
 
 // 验证上证指数和深证成指使用对应市场的指数日K接口。
 func TestIndexKLineRangeUsesSpecifiedIndexCodes(t *testing.T) {
-	previous := FetchIndexBarsPage
-	t.Cleanup(func() { FetchIndexBarsPage = previous })
-
 	loc := time.FixedZone("CST", 8*60*60)
 	startDate := time.Date(2026, 7, 24, 0, 0, 0, 0, loc)
 	endDate := startDate
@@ -268,14 +262,14 @@ func TestIndexKLineRangeUsesSpecifiedIndexCodes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			FetchIndexBarsPage = func(category uint16, market uint8, code string, start, count uint16) ([]proto.SecurityBar, error) {
+			fetch := Fetcher{IndexPage: func(category uint16, market uint8, code string, start, count uint16) ([]proto.SecurityBar, error) {
 				if category != 4 || market != tt.market || code != tt.code {
 					t.Fatalf("GetIndexBars request = category=%d market=%d code=%s", category, market, code)
 				}
 				return []proto.SecurityBar{{DateTime: startDate, Close: 3000}}, nil
-			}
+			}}
 
-			bars, err := IndexKLineRange(4, tt.market, tt.code, startDate, endDate)
+			bars, err := IndexKLineRange(fetch, 4, tt.market, tt.code, startDate, endDate)
 			if err != nil {
 				t.Fatalf("IndexKLineRange: %v", err)
 			}

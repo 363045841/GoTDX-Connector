@@ -105,14 +105,11 @@ func TestPaginateFromRecentToleratesPartialError(t *testing.T) {
 
 // 验证指数深页请求失败时缩小页大小并返回部分数据。
 func TestIndexKLineRangeUsesFallbackCountThenPartial(t *testing.T) {
-	prev := FetchIndexBarsPage
-	t.Cleanup(func() { FetchIndexBarsPage = prev })
-
 	type call struct {
 		start, count uint16
 	}
 	var calls []call
-	FetchIndexBarsPage = func(category uint16, market uint8, code string, start, count uint16) ([]proto.SecurityBar, error) {
+	fetch := Fetcher{IndexPage: func(category uint16, market uint8, code string, start, count uint16) ([]proto.SecurityBar, error) {
 		calls = append(calls, call{start, count})
 		if start == 0 && count == indexPageSize {
 			return []proto.SecurityBar{dayBar(2024, 1, 1), dayBar(2024, 1, 2)}, nil
@@ -124,11 +121,11 @@ func TestIndexKLineRangeUsesFallbackCountThenPartial(t *testing.T) {
 			return nil, fmt.Errorf("invalid kline datetime: 1376385400")
 		}
 		return nil, fmt.Errorf("unexpected start=%d count=%d", start, count)
-	}
+	}}
 
 	startDate := time.Date(2020, 1, 1, 0, 0, 0, 0, time.Local)
 	endDate := time.Date(2025, 1, 1, 0, 0, 0, 0, time.Local)
-	got, err := IndexKLineRange(4, 1, "000001", startDate, endDate)
+	got, err := IndexKLineRange(fetch, 4, 1, "000001", startDate, endDate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -166,11 +163,8 @@ func TestPaginateFromRecentSafetyCap(t *testing.T) {
 
 // 验证扩展行情短页K线按实际条数继续分页。
 func TestExKLineRangeAdvancesByActualShortPage(t *testing.T) {
-	prev := FetchExKLinePage
-	t.Cleanup(func() { FetchExKLinePage = prev })
-
 	var starts []uint32
-	FetchExKLinePage = func(category uint8, code string, period uint16, start uint32, count uint16, times uint16) ([]proto.ExKLineItem, error) {
+	fetch := Fetcher{ExPage: func(category uint8, code string, period uint16, start uint32, count uint16, times uint16) ([]proto.ExKLineItem, error) {
 		starts = append(starts, start)
 		_ = category
 		_ = code
@@ -192,11 +186,11 @@ func TestExKLineRangeAdvancesByActualShortPage(t *testing.T) {
 		default:
 			return nil, nil
 		}
-	}
+	}}
 
 	startDate := time.Date(2023, 1, 1, 0, 0, 0, 0, time.Local)
 	endDate := time.Date(2024, 12, 31, 0, 0, 0, 0, time.Local)
-	got, err := ExKLineRange(31, "01810", 4, 1, startDate, endDate)
+	got, err := ExKLineRange(fetch, 31, "01810", 4, 1, startDate, endDate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,11 +204,8 @@ func TestExKLineRangeAdvancesByActualShortPage(t *testing.T) {
 
 // 验证股票日K查询使用通用分页逻辑。
 func TestStockKLineRangeUsesPaginate(t *testing.T) {
-	prev := FetchStockKLinePage
-	t.Cleanup(func() { FetchStockKLinePage = prev })
-
 	var starts []uint16
-	FetchStockKLinePage = func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
+	fetch := Fetcher{StockPage: func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
 		starts = append(starts, start)
 		if start == 0 {
 			return []proto.SecurityBar{dayBar(2024, 1, 10), dayBar(2024, 1, 11)}, nil
@@ -223,11 +214,11 @@ func TestStockKLineRangeUsesPaginate(t *testing.T) {
 			return []proto.SecurityBar{dayBar(2023, 6, 1), dayBar(2023, 6, 2)}, nil
 		}
 		return nil, nil
-	}
+	}}
 
 	startDate := time.Date(2023, 1, 1, 0, 0, 0, 0, time.Local)
 	endDate := time.Date(2024, 12, 31, 0, 0, 0, 0, time.Local)
-	got, err := StockKLineRange(4, 1, "600000", 1, 0, startDate, endDate)
+	got, err := StockKLineRange(fetch, 4, 1, "600000", 1, 0, startDate, endDate)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,14 +232,12 @@ func TestStockKLineRangeUsesPaginate(t *testing.T) {
 
 // 验证 cursor 查询严格排除游标，并从较新页中选择最新 limit 条后按时间升序返回。
 func TestStockKLineBeforeUsesExclusiveCursorAndAscendingOrder(t *testing.T) {
-	prev := FetchStockKLinePage
-	t.Cleanup(func() { FetchStockKLinePage = prev })
 	loc := time.Local
 	newest := time.Date(2024, 1, 4, 15, 0, 0, 0, loc)
 	cursor := time.Date(2024, 1, 3, 15, 0, 0, 0, loc)
 	older := time.Date(2024, 1, 2, 15, 0, 0, 0, loc)
 	oldest := time.Date(2024, 1, 1, 15, 0, 0, 0, loc)
-	FetchStockKLinePage = func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
+	fetch := Fetcher{StockPage: func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
 		switch start {
 		case 0:
 			return []proto.SecurityBar{{DateTime: newest}, {DateTime: cursor}}, nil
@@ -257,9 +246,9 @@ func TestStockKLineBeforeUsesExclusiveCursorAndAscendingOrder(t *testing.T) {
 		default:
 			return nil, nil
 		}
-	}
+	}}
 
-	got, err := StockKLineBefore(4, 1, "600000", 1, 0, 2, &cursor)
+	got, err := StockKLineBefore(fetch, 4, 1, "600000", 1, 0, 2, &cursor)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -270,8 +259,6 @@ func TestStockKLineBeforeUsesExclusiveCursorAndAscendingOrder(t *testing.T) {
 
 // 验证深层 cursor 的扫描页大小独立于返回条数，避免小尾页逐根扫描全部历史。
 func TestStockKLineBeforeScansCursorUsingFullUpstreamPages(t *testing.T) {
-	prev := FetchStockKLinePage
-	t.Cleanup(func() { FetchStockKLinePage = prev })
 	base := time.Date(2020, 1, 1, 15, 0, 0, 0, time.Local)
 	dataset := make([]proto.SecurityBar, 2*int(klinePageSize)+10)
 	for i := range dataset {
@@ -292,7 +279,7 @@ func TestStockKLineBeforeScansCursorUsingFullUpstreamPages(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var counts []uint16
-			FetchStockKLinePage = func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
+			fetch := Fetcher{StockPage: func(category uint16, market uint8, code string, start, count uint16, times, adjust uint16) ([]proto.SecurityBar, error) {
 				counts = append(counts, count)
 				end := len(dataset) - int(start)
 				if end <= 0 {
@@ -300,8 +287,8 @@ func TestStockKLineBeforeScansCursorUsingFullUpstreamPages(t *testing.T) {
 				}
 				begin := max(0, end-int(count))
 				return dataset[begin:end], nil
-			}
-			got, err := StockKLineBefore(4, 1, "600000", 1, 0, tc.limit, tc.before)
+			}}
+			got, err := StockKLineBefore(fetch, 4, 1, "600000", 1, 0, tc.limit, tc.before)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -323,30 +310,26 @@ func TestStockKLineBeforeScansCursorUsingFullUpstreamPages(t *testing.T) {
 
 // 验证无数据品种（如已到期期货）返回确定性错误而非空序列，供 V1 层映射为可流转错误码。
 func TestStockKLineRangeReturnsErrNoKLineData(t *testing.T) {
-	prev := FetchStockKLinePage
-	t.Cleanup(func() { FetchStockKLinePage = prev })
-	FetchStockKLinePage = func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
+	fetch := Fetcher{StockPage: func(uint16, uint8, string, uint16, uint16, uint16, uint16) ([]proto.SecurityBar, error) {
 		return nil, nil
-	}
+	}}
 
 	startDate := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
 	endDate := time.Date(2026, 7, 31, 0, 0, 0, 0, time.Local)
-	if _, err := StockKLineRange(4, 1, "999999", 1, 0, startDate, endDate); !errors.Is(err, ErrNoKLineData) {
+	if _, err := StockKLineRange(fetch, 4, 1, "999999", 1, 0, startDate, endDate); !errors.Is(err, ErrNoKLineData) {
 		t.Fatalf("err = %v, want ErrNoKLineData", err)
 	}
 }
 
 // 验证扩展行情无数据品种返回 ErrNoKLineData，即已到期期货场景。
 func TestExKLineRangeReturnsErrNoKLineData(t *testing.T) {
-	prev := FetchExKLinePage
-	t.Cleanup(func() { FetchExKLinePage = prev })
-	FetchExKLinePage = func(uint8, string, uint16, uint32, uint16, uint16) ([]proto.ExKLineItem, error) {
+	fetch := Fetcher{ExPage: func(uint8, string, uint16, uint32, uint16, uint16) ([]proto.ExKLineItem, error) {
 		return nil, nil
-	}
+	}}
 
 	startDate := time.Date(2026, 7, 1, 0, 0, 0, 0, time.Local)
 	endDate := time.Date(2026, 7, 31, 0, 0, 0, 0, time.Local)
-	if _, err := ExKLineRange(31, "IF2507", 4, 1, startDate, endDate); !errors.Is(err, ErrNoKLineData) {
+	if _, err := ExKLineRange(fetch, 31, "IF2507", 4, 1, startDate, endDate); !errors.Is(err, ErrNoKLineData) {
 		t.Fatalf("err = %v, want ErrNoKLineData", err)
 	}
 }

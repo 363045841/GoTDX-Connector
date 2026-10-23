@@ -110,11 +110,13 @@ func TestRunHeartbeatStopsWhenContextIsCancelled(t *testing.T) {
 
 // 验证心跳启动拒绝无效的间隔和失败阈值配置。
 func TestStartHeartbeatRejectsInvalidConfiguration(t *testing.T) {
+	manager := NewDefaultManager(Options{})
+	t.Cleanup(func() { _ = manager.Close() })
 	ctx := context.Background()
-	if _, err := StartHeartbeat(ctx, 0, 3); err == nil {
+	if _, err := StartHeartbeat(ctx, manager, 0, 3); err == nil {
 		t.Fatal("StartHeartbeat accepted zero interval")
 	}
-	if _, err := StartHeartbeat(ctx, time.Second, 0); err == nil {
+	if _, err := StartHeartbeat(ctx, manager, time.Second, 0); err == nil {
 		t.Fatal("StartHeartbeat accepted zero failure threshold")
 	}
 }

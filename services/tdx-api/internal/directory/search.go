@@ -10,45 +10,53 @@ import (
 	"time"
 
 	"KlineChartQuantGo/services/tdx-api/internal/client"
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 	"github.com/bensema/gotdx/proto"
-	"github.com/bensema/gotdx/types"
 )
 
 const (
-	defaultTTL            = 24 * time.Hour
-	exDirectoryPageSize   = 1000
-	defaultSearchLimit    = 20
-	maxSearchLimit        = 100
-	directoryRetryDelay   = time.Minute
+	defaultTTL          = 24 * time.Hour
+	exDirectoryPageSize = 1000
+	directoryRetryDelay = time.Minute
 )
 
 // GotdxLoader 通过 gotdx 客户端加载证券目录。
-type GotdxLoader struct{}
-
-func (GotdxLoader) StockAll(market uint8) ([]proto.Security, error) {
-	return mainCall(func(c client.MainQuerier) ([]proto.Security, error) { return c.StockAll(market) })
+type GotdxLoader struct {
+	Manager *client.Manager
 }
 
-func (GotdxLoader) ExCount() (uint32, error) {
-	return exCall(func(c client.ExQuerier) (uint32, error) { return c.ExCount() })
+func (l GotdxLoader) StockAll(market uint8) ([]proto.Security, error) {
+	return client.QueryMain(l.Manager, func(c client.MainQuerier) ([]proto.Security, error) {
+		return c.StockAll(market)
+	})
 }
 
-func (GotdxLoader) ExList(start uint32, count uint16) ([]proto.ExListItem, error) {
-	return exCall(func(c client.ExQuerier) ([]proto.ExListItem, error) { return c.ExList(start, count) })
+func (l GotdxLoader) ExCount() (uint32, error) {
+	return client.QueryEx(l.Manager, func(c client.ExQuerier) (uint32, error) { return c.ExCount() })
+}
+
+func (l GotdxLoader) ExList(start uint32, count uint16) ([]proto.ExListItem, error) {
+	return client.QueryEx(l.Manager, func(c client.ExQuerier) ([]proto.ExListItem, error) {
+		return c.ExList(start, count)
+	})
 }
 
 // Cache 证券目录缓存：TTL 内复用内存目录，过期刷新，持久化失败不影响可用性。
+// 加载在锁外进行，并发调用等待同一次加载结果，避免全量拉取阻塞所有搜索。
 type Cache struct {
-	loader    Loader
-	store     Store
-	ttl       time.Duration
-	now       func() time.Time
+	loader Loader
+	store  Store
+	ttl    time.Duration
+	now    func() time.Time
+
 	mu        sync.Mutex
 	entries   []Item
 	loadedAt  time.Time
 	retryAt   time.Time
+	lastError error
 	loaded    bool
 	storeRead bool
+	loading   chan struct{}
 }
 
 // NewCache 创建证券目录缓存。
@@ -73,59 +81,107 @@ func (c *Cache) Search(query string, limit int) ([]Item, error) {
 		return nil, err
 	}
 	needle := strings.ToLower(query)
-	matches := make([]Item, 0)
+	type ranked struct {
+		item Item
+		rank int
+	}
+	matches := make([]ranked, 0, len(entries))
 	for _, entry := range entries {
-		if matchRank(entry, needle) < 6 {
-			matches = append(matches, entry)
+		if rank := matchRank(entry, needle); rank < 6 {
+			matches = append(matches, ranked{item: entry, rank: rank})
 		}
 	}
-	sort.SliceStable(matches, func(i, j int) bool {
-		return matchRank(matches[i], needle) < matchRank(matches[j], needle)
-	})
+	sort.SliceStable(matches, func(i, j int) bool { return matches[i].rank < matches[j].rank })
 	if limit < len(matches) {
 		matches = matches[:limit]
 	}
-	return matches, nil
+	items := make([]Item, len(matches))
+	for i, match := range matches {
+		items[i] = match.item
+	}
+	return items, nil
 }
 
+// directory 返回当前目录；缓存过期时由第一个调用者加载，其余调用者等待同一次结果。
 func (c *Cache) directory() ([]Item, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.loadPersistedDirectory()
-	now := c.now()
-	if c.loaded && (now.Sub(c.loadedAt) < c.ttl || now.Before(c.retryAt)) {
-		return c.entries, nil
+	for {
+		now := c.now()
+		c.mu.Lock()
+		c.loadPersistedDirectoryLocked()
+		if c.loaded && (now.Sub(c.loadedAt) < c.ttl || now.Before(c.retryAt)) {
+			entries := c.entries
+			c.mu.Unlock()
+			return entries, nil
+		}
+		if c.loading != nil {
+			wait := c.loading
+			c.mu.Unlock()
+			<-wait
+			continue
+		}
+		// 无缓存且处于失败退避期：直接返回上次错误，避免并发调用反复重试上游。
+		if !c.loaded && c.lastError != nil && now.Before(c.retryAt) {
+			err := c.lastError
+			c.mu.Unlock()
+			return nil, err
+		}
+		c.loading = make(chan struct{})
+		c.mu.Unlock()
+
+		entries, err := c.refresh()
+		if err == nil {
+			c.persist(entries, now)
+		}
+
+		c.mu.Lock()
+		if err == nil {
+			c.entries = entries
+			c.loadedAt = now
+			c.retryAt = time.Time{}
+			c.lastError = nil
+			c.loaded = true
+		} else {
+			c.retryAt = now.Add(directoryRetryDelay)
+			c.lastError = err
+		}
+		close(c.loading)
+		c.loading = nil
+		loaded, entries, lastError := c.loaded, c.entries, c.lastError
+		c.mu.Unlock()
+
+		if loaded {
+			return entries, nil
+		}
+		return nil, lastError
 	}
-	log.Printf("symbol directory: fetching from gotdx (previous entries=%d)", len(c.entries))
+}
+
+// refresh 从上游加载完整目录并记录耗时。
+func (c *Cache) refresh() ([]Item, error) {
 	started := time.Now()
 	entries, err := c.loadDirectory()
 	if err != nil {
-		if c.loaded {
-			c.retryAt = now.Add(directoryRetryDelay)
-			log.Printf("symbol directory: gotdx fetch failed, using stale cache entries=%d age=%s err=%v",
-				len(c.entries), now.Sub(c.loadedAt).Round(time.Second), err)
-			return c.entries, nil
-		}
-		log.Printf("symbol directory: gotdx fetch failed with no cache: %v", err)
 		return nil, err
 	}
-	elapsed := time.Since(started).Round(time.Millisecond)
-	if c.store != nil {
-		if err := c.store.Replace(Snapshot{Entries: entries, LoadedAt: now}); err != nil {
-			log.Printf("symbol directory database write failed: %v", err)
-		} else {
-			log.Printf("symbol directory: persisted %d entries to sqlite in %s", len(entries), elapsed)
-		}
-	}
-	log.Printf("symbol directory: loaded %d entries from gotdx in %s", len(entries), elapsed)
-	c.entries = entries
-	c.loadedAt = now
-	c.retryAt = time.Time{}
-	c.loaded = true
-	return c.entries, nil
+	log.Printf("symbol directory: loaded %d entries from gotdx in %s",
+		len(entries), time.Since(started).Round(time.Millisecond))
+	return entries, nil
 }
 
-func (c *Cache) loadPersistedDirectory() {
+// persist 写入快照；失败只记录日志，内存目录仍然可用。
+func (c *Cache) persist(entries []Item, loadedAt time.Time) {
+	if c.store == nil {
+		return
+	}
+	if err := c.store.Replace(Snapshot{Entries: entries, LoadedAt: loadedAt}); err != nil {
+		log.Printf("symbol directory database write failed: %v", err)
+		return
+	}
+	log.Printf("symbol directory: persisted %d entries to sqlite", len(entries))
+}
+
+// loadPersistedDirectoryLocked 首次使用时读取持久化快照，调用方必须持有 c.mu。
+func (c *Cache) loadPersistedDirectoryLocked() {
 	if c.storeRead || c.store == nil {
 		return
 	}
@@ -135,17 +191,18 @@ func (c *Cache) loadPersistedDirectory() {
 		log.Printf("symbol directory database read failed: %v", err)
 		return
 	}
-	if found {
-		c.entries = snapshot.Entries
-		c.loadedAt = snapshot.LoadedAt
-		c.loaded = true
-		age := c.now().Sub(snapshot.LoadedAt).Round(time.Second)
-		log.Printf("symbol directory: loaded %d entries from sqlite (age=%s)", len(snapshot.Entries), age)
-	} else {
+	if !found {
 		log.Printf("symbol directory: no sqlite snapshot found")
+		return
 	}
+	c.entries = snapshot.Entries
+	c.loadedAt = snapshot.LoadedAt
+	c.loaded = true
+	log.Printf("symbol directory: loaded %d entries from sqlite (age=%s)",
+		len(snapshot.Entries), c.now().Sub(snapshot.LoadedAt).Round(time.Second))
 }
 
+// loadDirectory 拉取主市场与扩展行情全部条目。
 func (c *Cache) loadDirectory() ([]Item, error) {
 	entries := make([]Item, 0)
 	seen := make(map[string]struct{})
@@ -154,16 +211,16 @@ func (c *Cache) loadDirectory() ([]Item, error) {
 		if err != nil {
 			return nil, err
 		}
+		exchange := instrument.Exchange(market)
 		for _, stock := range stocks {
-			exchange := mainExchange(market)
 			item := Item{
 				Symbol: stock.Code, Description: stock.Name, Exchange: exchange, Source: "gotdx",
-				Params: map[string]any{
-					"market": market,
-					"kind":   mainMarketSymbolKind(stock.Code, exchange),
+				Routing: instrument.Routing{
+					Kind:   instrument.KindForMainMarket(stock.Code, market),
+					Market: market,
 				},
 			}
-			appendUnique(&entries, seen, "market", market, item)
+			appendUnique(&entries, seen, item)
 		}
 	}
 
@@ -183,19 +240,17 @@ func (c *Cache) loadDirectory() ([]Item, error) {
 		for _, ex := range items {
 			item := Item{
 				Symbol: ex.Code, Description: ex.Name, Exchange: extendedExchange(ex.Market), Source: "gotdx",
-				Params: map[string]any{
-					"category": ex.Category,
-					"kind":     KindEx,
-				},
+				Routing: instrument.Routing{Kind: instrument.Ex, Category: ex.Category},
 			}
-			appendUnique(&entries, seen, "category", ex.Category, item)
+			appendUnique(&entries, seen, item)
 		}
 	}
 	return entries, nil
 }
 
-func appendUnique(entries *[]Item, seen map[string]struct{}, kind string, market uint8, item Item) {
-	key := fmt.Sprintf("%s:%s:%d:%s", item.Source, kind, market, item.Symbol)
+// appendUnique 以规范品种 ID 去重，避免同一条目被多次加载。
+func appendUnique(entries *[]Item, seen map[string]struct{}, item Item) {
+	key := item.Routing.ID(item.Source, item.Symbol)
 	if _, exists := seen[key]; exists {
 		return
 	}
@@ -224,40 +279,10 @@ func matchRank(item Item, query string) int {
 	}
 }
 
-func mainExchange(market uint8) string {
-	switch market {
-	case 0:
-		return "SZ"
-	case 1:
-		return "SH"
-	case 2:
-		return "BJ"
-	default:
-		return fmt.Sprintf("CN-%d", market)
-	}
-}
-
-// mainMarketSymbolKind 用 gotdx types.IsIndex(code.EXCHANGE) 判定主市场品种
-func mainMarketSymbolKind(code, exchange string) string {
-	// IsIndex 要求 9 位形如 000001.SH
-	if types.IsIndex(fmt.Sprintf("%s.%s", code, strings.ToUpper(exchange))) {
-		return KindIndex
-	}
-	return KindStock
-}
-
 func extendedExchange(market uint8) string {
 	labels := map[uint8]string{1: "CN", 2: "HK", 3: "FUTURES", 4: "FX", 5: "INDEX", 6: "VALUATION", 7: "MONEY", 8: "FUND", 9: "MONEY_FUND", 10: "INDICATOR", 11: "MIRROR", 12: "OPTION", 13: "US", 14: "DE", 15: "SG"}
 	if label, ok := labels[market]; ok {
 		return label
 	}
 	return fmt.Sprintf("EX-%d", market)
-}
-
-func mainCall[T any](operation func(client.MainQuerier) (T, error)) (T, error) {
-	return client.QueryMain(operation)
-}
-
-func exCall[T any](operation func(client.ExQuerier) (T, error)) (T, error) {
-	return client.QueryEx(operation)
 }

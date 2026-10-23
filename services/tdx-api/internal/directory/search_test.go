@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 	"github.com/bensema/gotdx/proto"
 )
 
@@ -92,7 +93,7 @@ func TestSymbolDirectoryCacheUsesFreshPersistedSnapshot(t *testing.T) {
 	store := &fakeStore{snapshot: Snapshot{
 		Entries: []Item{{
 			Symbol: "000001", Description: "Ping An", Exchange: "SZ", Source: "gotdx",
-			Params: map[string]any{"market": uint8(0), "kind": "stock"},
+			Routing: instrument.Routing{Kind: instrument.Stock, Market: 0},
 		}},
 		LoadedAt: now.Add(-time.Hour),
 	}, found: true}
@@ -115,7 +116,7 @@ func TestSymbolDirectoryCacheUsesStalePersistedSnapshotWhenRefreshFails(t *testi
 	store := &fakeStore{snapshot: Snapshot{
 		Entries: []Item{{
 			Symbol: "000001", Description: "Ping An", Exchange: "SZ", Source: "gotdx",
-			Params: map[string]any{"market": uint8(0), "kind": "stock"},
+			Routing: instrument.Routing{Kind: instrument.Stock, Market: 0},
 		}},
 		LoadedAt: now.Add(-25 * time.Hour),
 	}, found: true}
@@ -267,7 +268,7 @@ func TestSymbolSearchReturnsGotdxMetadataAndDeduplicates(t *testing.T) {
 		Description: "Ping An Bank",
 		Exchange:    "SZ",
 		Source:      "gotdx",
-		Params:      map[string]any{"market": uint8(0), "kind": KindStock},
+		Routing:     instrument.Routing{Kind: instrument.Stock, Market: 0},
 	}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("main item = %#v, want %#v", got, want)
 	}
@@ -284,9 +285,34 @@ func TestSymbolSearchReturnsGotdxMetadataAndDeduplicates(t *testing.T) {
 		Description: "Tencent",
 		Exchange:    "HK",
 		Source:      "gotdx",
-		Params:      map[string]any{"category": uint8(7), "kind": KindEx},
+		Routing:     instrument.Routing{Kind: instrument.Ex, Category: 7},
 	}); !reflect.DeepEqual(got, want) {
 		t.Fatalf("extended item = %#v, want %#v", got, want)
+	}
+}
+
+// 验证同码股票与指数各自得到规范路由与 ID，指数不会被落到 market 0。
+func TestSymbolDirectoryRoutesMainMarketByCodeAndMarket(t *testing.T) {
+	now := time.Unix(0, 0)
+	loader := &fakeLoader{stocks: map[uint8][]proto.Security{
+		0: {{Code: "000001", Name: "平安银行"}},
+		1: {{Code: "000001", Name: "上证指数"}},
+	}}
+	cache := newTestCache(loader, &now)
+
+	items, err := cache.Search("000001", 20)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	byID := make(map[string]Item, len(items))
+	for _, item := range items {
+		byID[item.Routing.ID(item.Source, item.Symbol)] = item
+	}
+	if got := byID["gotdx:index:1:000001"].Routing; got != (instrument.Routing{Kind: instrument.Index, Market: 1}) {
+		t.Fatalf("index routing = %#v, want index on market 1", got)
+	}
+	if got := byID["gotdx:stock:0:000001"].Routing; got != (instrument.Routing{Kind: instrument.Stock, Market: 0}) {
+		t.Fatalf("stock routing = %#v, want stock on market 0", got)
 	}
 }
 
@@ -306,7 +332,7 @@ func TestSymbolDirectoryCacheReusesFreshDirectory(t *testing.T) {
 	}
 }
 
-// 验证刷新失败后符号目录缓存回退旧内存目录。
+// 验证刷新失败后符号目录缓存回退旧内存目录，并在退避期内不重复请求上游。
 func TestSymbolDirectoryCacheFallsBackToOldDirectoryAfterRefreshFailure(t *testing.T) {
 	now := time.Unix(0, 0)
 	loader := &fakeLoader{stocks: map[uint8][]proto.Security{0: {{Code: "000001", Name: "Ping An"}}}}

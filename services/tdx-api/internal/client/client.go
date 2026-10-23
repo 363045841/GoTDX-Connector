@@ -5,41 +5,27 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"os"
-	"strings"
-	"sync"
 	"time"
 
 	"github.com/bensema/gotdx"
 	"github.com/bensema/gotdx/proto"
 )
 
-var (
-	defaultManagerOnce sync.Once
-	defaultManager     *Manager
-)
+// Options 解析后的 gotdx 连接配置；环境变量只在 main 的 config 中读取。
+type Options struct {
+	AutoSelect bool
+	MainHosts  []string
+	ExHosts    []string
+	MACHosts   []string
+}
 
-func DefaultManager() *Manager {
-	defaultManagerOnce.Do(func() {
-		defaultManager = newManager(map[Domain]domainConfig{
-			DomainMain: defaultDomainConfig(DomainMain),
-			DomainEx:   defaultDomainConfig(DomainEx),
-			DomainMAC:  defaultDomainConfig(DomainMAC),
-		})
+// NewDefaultManager 按给定配置创建三个行情域的管理器。
+func NewDefaultManager(opts Options) *Manager {
+	return newManager(map[Domain]domainConfig{
+		DomainMain: domainConfigFor(DomainMain, opts),
+		DomainEx:   domainConfigFor(DomainEx, opts),
+		DomainMAC:  domainConfigFor(DomainMAC, opts),
 	})
-	return defaultManager
-}
-
-func Start() error {
-	return DefaultManager().Start()
-}
-
-func Close() error {
-	return DefaultManager().Close()
-}
-
-func CloseContext(ctx context.Context) error {
-	return DefaultManager().CloseContext(ctx)
 }
 
 type MainQuerier interface {
@@ -70,43 +56,49 @@ type ExQuerier interface {
 	ExTable() (string, error)
 }
 
-// QueryMain executes one bounded, read-only main-market request with one recovery retry.
-func QueryMain[T any](operation func(MainQuerier) (T, error)) (T, error) {
-	return execute(DefaultManager(), DomainMain, func(c *gotdx.Client) (T, error) { return operation(c) })
+// QueryMain 在主市场客户端上执行一次带恢复重试的只读请求。
+func QueryMain[T any](manager *Manager, operation func(MainQuerier) (T, error)) (T, error) {
+	return execute(manager, DomainMain, func(c *gotdx.Client) (T, error) { return operation(c) })
 }
 
-func ProbeMain[T any](operation func(MainQuerier) (T, error)) (T, error) {
-	result, _, err := executeOnce(DefaultManager(), DomainMain, func(c *gotdx.Client) (T, error) { return operation(c) })
+// ProbeMain 在主市场客户端上执行一次不重试的探测请求。
+func ProbeMain[T any](manager *Manager, operation func(MainQuerier) (T, error)) (T, error) {
+	result, _, err := executeOnce(manager, DomainMain, func(c *gotdx.Client) (T, error) { return operation(c) })
 	return result, err
 }
 
-// QueryEx executes one bounded, read-only extended-market request with one recovery retry.
-func QueryEx[T any](operation func(ExQuerier) (T, error)) (T, error) {
-	return execute(DefaultManager(), DomainEx, func(c *gotdx.Client) (T, error) { return operation(c) })
+// QueryEx 在扩展行情客户端上执行一次带恢复重试的只读请求。
+func QueryEx[T any](manager *Manager, operation func(ExQuerier) (T, error)) (T, error) {
+	return execute(manager, DomainEx, func(c *gotdx.Client) (T, error) { return operation(c) })
 }
 
-func defaultDomainConfig(domain Domain) domainConfig {
+// domainConfigFor 构造单个行情域的构建、连接与关闭动作。
+func domainConfigFor(domain Domain, opts Options) domainConfig {
 	return domainConfig{
-		build:   func() *gotdx.Client { return buildDomainClient(domain) },
+		build:   func() *gotdx.Client { return buildDomainClient(domain, opts) },
 		connect: func(c *gotdx.Client) error { return connectDomainClient(domain, c) },
 		close:   func(c *gotdx.Client) error { return c.Disconnect() },
 	}
 }
 
-func buildDomainClient(domain Domain) *gotdx.Client {
-	var label, envKey string
-	var defaults []string
+// buildDomainClient 按域选择内置主机或显式配置的地址。
+func buildDomainClient(domain Domain, opts Options) *gotdx.Client {
+	var (
+		label      string
+		configured []string
+		defaults   []string
+	)
 	switch domain {
 	case DomainMain:
-		label, envKey, defaults = "main", "GOTDX_MAIN_HOSTS", gotdx.MainHostAddresses()
+		label, configured, defaults = "main", opts.MainHosts, gotdx.MainHostAddresses()
 	case DomainEx:
-		label, envKey, defaults = "ex", "GOTDX_EX_HOSTS", gotdx.ExHostAddresses()
+		label, configured, defaults = "ex", opts.ExHosts, gotdx.ExHostAddresses()
 	case DomainMAC:
-		label, envKey, defaults = "mac", "GOTDX_MAC_HOSTS", gotdx.MACHostAddresses()
+		label, configured, defaults = "mac", opts.MACHosts, gotdx.MACHostAddresses()
 	default:
 		return nil
 	}
-	hosts := resolveHosts(label, envKey, defaults, 2*time.Second)
+	hosts := resolveHosts(label, configured, defaults, 2*time.Second)
 	if len(hosts) == 0 {
 		log.Printf("[gotdx] no reachable %s hosts, using full default list", label)
 		hosts = defaults
@@ -115,25 +107,25 @@ func buildDomainClient(domain Domain) *gotdx.Client {
 		return nil
 	}
 	log.Printf("[gotdx] %s hosts (%d): %v", label, len(hosts), hosts)
-	opts := []gotdx.Option{gotdx.WithTimeoutSec(6)}
+	clientOpts := []gotdx.Option{gotdx.WithTimeoutSec(6)}
 	switch domain {
 	case DomainMain:
-		opts = append(opts, gotdx.WithTCPAddress(hosts[0]), gotdx.WithTCPAddressPool(hosts[1:]...))
+		clientOpts = append(clientOpts, gotdx.WithTCPAddress(hosts[0]), gotdx.WithTCPAddressPool(hosts[1:]...))
 	case DomainEx:
-		opts = append(opts, gotdx.WithExTCPAddress(hosts[0]), gotdx.WithExTCPAddressPool(hosts[1:]...))
+		clientOpts = append(clientOpts, gotdx.WithExTCPAddress(hosts[0]), gotdx.WithExTCPAddressPool(hosts[1:]...))
 	case DomainMAC:
-		opts = append(opts, gotdx.WithMacTCPAddress(hosts[0]), gotdx.WithMacTCPAddressPool(hosts[1:]...))
+		clientOpts = append(clientOpts, gotdx.WithMacTCPAddress(hosts[0]), gotdx.WithMacTCPAddressPool(hosts[1:]...))
 	}
-	if os.Getenv("GOTDX_AUTO_SELECT") == "1" {
-		opts = append(opts, gotdx.WithAutoSelectFastest(true))
+	if opts.AutoSelect {
+		clientOpts = append(clientOpts, gotdx.WithAutoSelectFastest(true))
 	}
 	switch domain {
 	case DomainEx:
-		return gotdx.NewEx(opts...)
+		return gotdx.NewEx(clientOpts...)
 	case DomainMAC:
-		return gotdx.NewMAC(opts...)
+		return gotdx.NewMAC(clientOpts...)
 	default:
-		return gotdx.New(opts...)
+		return gotdx.New(clientOpts...)
 	}
 }
 
@@ -155,11 +147,11 @@ func connectDomainClient(domain Domain, c *gotdx.Client) error {
 	}
 }
 
-func resolveHosts(label, envKey string, all []string, timeout time.Duration) []string {
-	if v := os.Getenv(envKey); v != "" {
-		addrs := strings.Split(v, ",")
-		log.Printf("[gotdx] %s: using env %s=%v", label, envKey, addrs)
-		return addrs
+// resolveHosts 优先使用显式配置；未配置时并发探测内置主机。
+func resolveHosts(label string, configured, all []string, timeout time.Duration) []string {
+	if len(configured) > 0 {
+		log.Printf("[gotdx] %s: using configured hosts %v", label, configured)
+		return configured
 	}
 
 	log.Printf("[gotdx] %s: probing %d hosts (timeout=%v)...", label, len(all), timeout)
@@ -176,4 +168,9 @@ func resolveHosts(label, envKey string, all []string, timeout time.Duration) []s
 	}
 	log.Printf("[gotdx] %s: %d/%d hosts reachable", label, len(reachable), len(all))
 	return reachable
+}
+
+// CloseContext 关闭管理器并等待在途请求结束；ctx 到期时返回 ctx.Err()。
+func CloseContext(ctx context.Context, manager *Manager) error {
+	return manager.CloseContext(ctx)
 }

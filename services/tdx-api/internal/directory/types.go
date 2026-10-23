@@ -1,27 +1,20 @@
-// 证券目录领域类型：搜索条目、加载器、持久化接口与品种 kind 常量。
+// 证券目录领域类型：搜索条目、加载器与持久化接口。
 package directory
 
 import (
 	"time"
 
+	"KlineChartQuantGo/services/tdx-api/internal/instrument"
 	"github.com/bensema/gotdx/proto"
 )
 
-// 品种 kind：与 gotdx 品种分类对齐，供 api 包 K 线路由使用。
-const (
-	KindStock = "stock"
-	KindIndex = "index"
-	KindEx    = "ex"
-)
-
-// Item 证券目录搜索条目。
-// Params 含 market|category 与 kind（stock|index|ex），前端原样带回拉 K 线。
+// Item 证券目录条目；Routing 是唯一的路由事实，搜索响应与后续查询都由它派生。
 type Item struct {
-	Symbol      string `json:"symbol"`
-	Description string `json:"description"`
-	Exchange    string `json:"exchange"`
-	Source      string `json:"source"`
-	Params      map[string]any `json:"params"`
+	Symbol      string             `json:"symbol"`
+	Description string             `json:"description"`
+	Exchange    string             `json:"exchange"`
+	Source      string             `json:"source"`
+	Routing     instrument.Routing `json:"routing"`
 }
 
 // Loader 证券目录数据源加载接口，隐藏 gotdx 主站/扩展行情访问细节。
@@ -33,8 +26,8 @@ type Loader interface {
 
 // Snapshot 证券目录持久化快照。
 type Snapshot struct {
-	Entries  []Item
-	LoadedAt time.Time
+	Entries  []Item    `json:"entries"`
+	LoadedAt time.Time `json:"loadedAt"`
 }
 
 // Store 证券目录持久化存储接口。
