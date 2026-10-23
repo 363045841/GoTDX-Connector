@@ -9,6 +9,7 @@ import (
 
 	"KlineChartQuantGo/services/tdx-api/internal/client"
 	"KlineChartQuantGo/services/tdx-api/internal/directory"
+	"KlineChartQuantGo/services/tdx-api/internal/live"
 	"github.com/bensema/gotdx/proto"
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -95,6 +96,7 @@ func RegisterRoutes(r *gin.Engine, symbolCache *directory.Cache, status func() c
 	v1 := r.Group("/api/v1/market-data")
 	{
 		v1.GET("/sources/:sourceId/probe", handleV1Probe(status))
+		v1.GET("/sources/:sourceId/stream", handleV1Stream(live.NewHub(liveHubConfigFromEnv()), symbolCache))
 		v1.POST("/instruments/search", handleV1Search(symbolCache))
 		v1.POST("/bars", handleV1Bars)
 		v1.POST("/trading-calendar", handleV1TradingCalendar)

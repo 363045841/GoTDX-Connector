@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -29,7 +30,14 @@ func main() {
 	}
 	router := server.NewRouter()
 	addr := fmt.Sprintf(":%s", port)
-	server := &http.Server{Addr: addr, Handler: router}
+	// 请求上下文派生自 baseContext：Shutdown 开始时取消，使长连接 SSE 立即退出而非拖满超时。
+	baseContext, cancelBase := context.WithCancel(context.Background())
+	server := &http.Server{
+		Addr:        addr,
+		Handler:     router,
+		BaseContext: func(net.Listener) context.Context { return baseContext },
+	}
+	server.RegisterOnShutdown(cancelBase)
 	serverErrors := make(chan error, 1)
 
 	log.Printf("starting gotdx server on http://127.0.0.1%s", addr)
