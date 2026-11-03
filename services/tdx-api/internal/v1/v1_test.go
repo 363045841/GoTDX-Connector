@@ -70,8 +70,8 @@ func TestV1ProbeOnline(t *testing.T) {
 			CheckedAt    int64  `json:"checkedAt"`
 			LatencyMs    int64  `json:"latencyMs"`
 			Capabilities struct {
-				AssetClasses []string `json:"assetClasses"`
-				Bars         struct {
+				InstrumentTypes []string `json:"instrumentTypes"`
+				Bars            struct {
 					Periods           []string `json:"periods"`
 					Adjustments       []string `json:"adjustments"`
 					MaxBarsPerRequest int      `json:"maxBarsPerRequest"`
@@ -95,8 +95,8 @@ func TestV1ProbeOnline(t *testing.T) {
 	if caps.Bars.MaxBarsPerRequest != 798 {
 		t.Fatalf("bars.maxBarsPerRequest = %d, want 798", caps.Bars.MaxBarsPerRequest)
 	}
-	if len(caps.AssetClasses) != 6 || len(caps.Bars.Periods) != 10 {
-		t.Fatalf("capabilities = %#v, want 6 assetClasses and 10 periods", caps)
+	if len(caps.InstrumentTypes) != 6 || len(caps.Bars.Periods) != 10 {
+		t.Fatalf("capabilities = %#v, want 6 instrumentTypes and 10 periods", caps)
 	}
 	if !caps.TimeShare || caps.Depth {
 		t.Fatalf("capabilities = %#v, want timeShare true depth false", caps)
@@ -169,15 +169,15 @@ func (e *errV1ProbeDown) Error() string { return "heartbeat refused" }
 
 // v1SearchItem 搜索响应的测试视图。
 type v1SearchItem struct {
-	ID           string         `json:"id"`
-	SourceID     string         `json:"sourceId"`
-	Symbol       string         `json:"symbol"`
-	Name         string         `json:"name"`
-	AssetClass   string         `json:"assetClass"`
-	Exchange     string         `json:"exchange"`
-	SessionID    string         `json:"sessionId"`
-	ProviderRef  map[string]any `json:"providerRef"`
-	Capabilities struct {
+	ID             string         `json:"id"`
+	SourceID       string         `json:"sourceId"`
+	Symbol         string         `json:"symbol"`
+	Name           string         `json:"name"`
+	InstrumentType string         `json:"instrumentType"`
+	Exchange       string         `json:"exchange"`
+	SessionID      string         `json:"sessionId"`
+	ProviderRef    map[string]any `json:"providerRef"`
+	Capabilities   struct {
 		Bars struct {
 			Periods     []string `json:"periods"`
 			Adjustments []string `json:"adjustments"`
@@ -224,10 +224,10 @@ func TestV1SearchMapsInstruments(t *testing.T) {
 	if stock == nil || index == nil {
 		t.Fatalf("items = %#v, want gotdx:stock:0:000001 and gotdx:index:1:000001", body.Data.Items)
 	}
-	if stock.AssetClass != "stock" || stock.SessionID != "CN" || stock.Exchange != "SZ" {
+	if stock.InstrumentType != "stock" || stock.SessionID != "CN" || stock.Exchange != "SZ" {
 		t.Fatalf("stock = %#v, want stock CN SZ", stock)
 	}
-	if index.AssetClass != "index" || index.Exchange != "SH" {
+	if index.InstrumentType != "index" || index.Exchange != "SH" {
 		t.Fatalf("index = %#v, want index SH", index)
 	}
 	if index.ProviderRef["kind"] != "index" || index.ProviderRef["market"] != float64(1) {

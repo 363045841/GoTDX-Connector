@@ -100,10 +100,10 @@ type v1SourceProbe struct {
 
 // v1InstrumentSearchRequest 品种目录搜索请求。
 type v1InstrumentSearchRequest struct {
-	SourceID     string   `json:"sourceId"`
-	Keyword      string   `json:"keyword"`
-	Limit        int      `json:"limit"`
-	AssetClasses []string `json:"assetClasses,omitempty"`
+	SourceID        string   `json:"sourceId"`
+	Keyword         string   `json:"keyword"`
+	Limit           int      `json:"limit"`
+	InstrumentTypes []string `json:"instrumentTypes,omitempty"`
 }
 
 // v1InstrumentSearchResult 品种目录搜索结果。

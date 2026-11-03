@@ -1,4 +1,4 @@
-// V1 协议映射层：负责周期/复权/时区/资产类别的转换，以及内部数据到 V1 DTO 的映射。
+// V1 协议映射层：负责周期/复权/时区/品种类型的转换，以及内部数据到 V1 DTO 的映射。
 // 映射表与前端旧 gotdx.ts 的 PERIOD_TO_CATEGORY / ADJUST_MAP 保持一致。
 package v1
 
@@ -64,7 +64,7 @@ type v1HistoryCoverage struct {
 // v1SourceCapabilities V1 源级能力声明，前端流转层据此筛选候选源。
 type v1SourceCapabilities struct {
 	TradingCalendar bool                        `json:"tradingCalendar"`
-	AssetClasses    []string                    `json:"assetClasses"`
+	InstrumentTypes []string                    `json:"instrumentTypes"`
 	Bars            *v1BarCapability            `json:"bars,omitempty"`
 	TimeShare       *bool                       `json:"timeShare,omitempty"`
 	TimeShareRange  *v1TimeShareRangeCapability `json:"timeShareRange,omitempty"`
@@ -75,7 +75,7 @@ type v1SourceCapabilities struct {
 }
 
 // v1SourceCapabilitiesFor 构建 gotdx 源级能力声明。
-// 资产类别覆盖主市场 A 股/指数与扩展行情全部可路由类别。
+// 品种类型覆盖主市场 A 股/指数与扩展行情全部可路由类别。
 // 历史覆盖只声明上界（数据可到当下）：分时/分钟线历史明显浅于日线，无单一诚实的下界可声明，
 // 更早区间的真实可用性交由 INSTRUMENT_NOT_FOUND 确定性错误在流转时判定。
 func v1SourceCapabilitiesFor() v1SourceCapabilities {
@@ -83,7 +83,7 @@ func v1SourceCapabilitiesFor() v1SourceCapabilities {
 	now := time.Now().UnixMilli()
 	return v1SourceCapabilities{
 		TradingCalendar: true,
-		AssetClasses:    []string{"stock", "index", "fund", "future", "option", "forex"},
+		InstrumentTypes: []string{"stock", "index", "fund", "future", "option", "forex"},
 		Bars: &v1BarCapability{
 			Periods:           append([]string(nil), v1KLinePeriods...),
 			Adjustments:       []string{"qfq", "hfq", "none"},
@@ -133,16 +133,16 @@ func v1AdjustmentSupported(kind, adjustment string) bool {
 
 // v1InstrumentDescriptor V1 品种描述，与前端 V1InstrumentDescriptor 对齐。
 type v1InstrumentDescriptor struct {
-	ID           string                   `json:"id"`
-	SourceID     string                   `json:"sourceId"`
-	Symbol       string                   `json:"symbol"`
-	Name         string                   `json:"name"`
-	AssetClass   string                   `json:"assetClass"`
-	Exchange     string                   `json:"exchange"`
-	SessionID    string                   `json:"sessionId,omitempty"`
-	Currency     string                   `json:"currency,omitempty"`
-	ProviderRef  map[string]any           `json:"providerRef,omitempty"`
-	Capabilities v1InstrumentCapabilities `json:"capabilities"`
+	ID             string                   `json:"id"`
+	SourceID       string                   `json:"sourceId"`
+	Symbol         string                   `json:"symbol"`
+	Name           string                   `json:"name"`
+	InstrumentType string                   `json:"instrumentType"`
+	Exchange       string                   `json:"exchange"`
+	SessionID      string                   `json:"sessionId,omitempty"`
+	Currency       string                   `json:"currency,omitempty"`
+	ProviderRef    map[string]any           `json:"providerRef,omitempty"`
+	Capabilities   v1InstrumentCapabilities `json:"capabilities"`
 }
 
 // v1InstrumentReference V1 请求体中的品种引用，providerRef 由客户端原样带回。
@@ -189,8 +189,8 @@ func v1ExchangeToCurrency(exchange string) string {
 	}
 }
 
-// v1AssetClass 由品种 kind 与交易所归一化前端资产类别；规则与旧前端 resolveGotdxAssetClass 一致。
-func v1AssetClass(exchange, kind string) string {
+// v1InstrumentType 由品种 kind 与交易所归一化前端品种类型；规则与旧前端 resolveGotdxInstrumentType 一致。
+func v1InstrumentType(exchange, kind string) string {
 	if kind == domain.KindIndex {
 		return "index"
 	}
@@ -218,23 +218,23 @@ func v1AssetClass(exchange, kind string) string {
 // toV1Instrument 将目录条目映射为 V1 品种描述；ID 与 providerRef 由同一路由生成。
 func toV1Instrument(item directory.Item) v1InstrumentDescriptor {
 	kind := string(item.Routing.Kind)
-	assetClass := v1AssetClass(item.Exchange, kind)
+	instrumentType := v1InstrumentType(item.Exchange, kind)
 	caps := v1InstrumentCapabilitiesFor(kind)
 	if _, ok := futuresCalendarExchange(item.Exchange, item.Symbol); ok {
 		supported := true
 		caps.TradingCalendar = &supported
 	}
 	return v1InstrumentDescriptor{
-		ID:           item.Routing.ID(v1SourceID, item.Symbol),
-		SourceID:     v1SourceID,
-		Symbol:       item.Symbol,
-		Name:         item.Description,
-		AssetClass:   assetClass,
-		Exchange:     item.Exchange,
-		SessionID:    v1ExchangeToSession(item.Exchange),
-		Currency:     v1ExchangeToCurrency(item.Exchange),
-		ProviderRef:  item.Routing.ProviderRef(),
-		Capabilities: caps,
+		ID:             item.Routing.ID(v1SourceID, item.Symbol),
+		SourceID:       v1SourceID,
+		Symbol:         item.Symbol,
+		Name:           item.Description,
+		InstrumentType: instrumentType,
+		Exchange:       item.Exchange,
+		SessionID:      v1ExchangeToSession(item.Exchange),
+		Currency:       v1ExchangeToCurrency(item.Exchange),
+		ProviderRef:    item.Routing.ProviderRef(),
+		Capabilities:   caps,
 	}
 }
 
