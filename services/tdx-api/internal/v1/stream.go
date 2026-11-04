@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"KlineChartQuantGo/services/tdx-api/internal/directory"
@@ -53,6 +54,116 @@ type liveStreamDeps struct {
 	heartbeat time.Duration
 }
 
+// ── 批量实时订阅 ──
+
+// liveStreamTarget 已解析的品种与其批量订阅；一条 SSE 连接承载多个品种。
+type liveStreamTarget struct {
+	instrumentID string
+	sub          *live.Subscription
+}
+
+// liveStreamFrame 合并后的事件：帧身份由订阅目标补全。
+type liveStreamFrame struct {
+	instrumentID string
+	event        live.Event
+}
+
+// parseLiveInstruments 解析 instruments 参数；重复 ID 只保留首个，前缀不匹配直接拒绝。
+func parseLiveInstruments(raw string) ([]string, *v1APIError) {
+	ids := make([]string, 0, 4)
+	seen := make(map[string]struct{})
+	for _, part := range strings.Split(raw, ",") {
+		id := strings.TrimSpace(part)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		if _, _, err := instrument.ParseID(id, v1SourceID); err != nil {
+			return nil, &v1APIError{Code: v1CodeInvalidRequest, Message: "unknown instrumentId: " + id}
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, &v1APIError{Code: v1CodeInvalidRequest, Message: "instruments is required"}
+	}
+	return ids, nil
+}
+
+// subscribeLiveTargets 按同一序列身份批量订阅；部分失败时回滚已建立的订阅。
+func subscribeLiveTargets(deps liveStreamDeps, ids []string, period string, category uint16, adjustment string) ([]liveStreamTarget, *v1APIError, int) {
+	targets := make([]liveStreamTarget, 0, len(ids))
+	for _, instrumentID := range ids {
+		target, apiErr, status := resolveLiveTarget(deps.cache, "", instrumentID, "")
+		if apiErr != nil {
+			closeLiveTargets(targets)
+			return nil, apiErr, status
+		}
+		if !v1AdjustmentSupported(string(target.Routing.Kind), adjustment) {
+			closeLiveTargets(targets)
+			return nil, &v1APIError{
+				Code:    v1CodeUnsupportedCapability,
+				Message: fmt.Sprintf("adjustment %q is not supported for kind %q", adjustment, target.Routing.Kind),
+			}, http.StatusBadRequest
+		}
+		// 实时尾部的 qfq 与 none 数值一致（前复权以最新价为基准），默认 none；hfq 需显式指定。
+		adjust := v1AdjustToUint[adjustment]
+		if adjustment == "qfq" {
+			adjust = v1AdjustToUint["none"]
+		}
+		key := fmt.Sprintf("%s|%s|%d", target.ID(), period, adjust)
+		sub, err := deps.hub.Subscribe(key, live.Source{
+			Fetch:   deps.fetch(target, category, adjust),
+			Session: deps.session,
+		})
+		if err != nil {
+			closeLiveTargets(targets)
+			return nil, &v1APIError{Code: v1CodeUpstreamUnavailable, Message: err.Error()}, http.StatusServiceUnavailable
+		}
+		targets = append(targets, liveStreamTarget{instrumentID: target.ID(), sub: sub})
+	}
+	return targets, nil, 0
+}
+
+// closeLiveTargets 释放批量订阅。
+func closeLiveTargets(targets []liveStreamTarget) {
+	for _, target := range targets {
+		target.sub.Close()
+	}
+}
+
+// pumpLiveStream 把单个品种的事件转发到连接级通道；上游丢失时让连接结束由客户端重连。
+func pumpLiveStream(ctx context.Context, target liveStreamTarget, frames chan<- liveStreamFrame, lost chan<- struct{}) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-target.sub.Lost():
+			select {
+			case lost <- struct{}{}:
+			default:
+			}
+			return
+		case ev, ok := <-target.sub.Events():
+			if !ok {
+				return
+			}
+			select {
+			case frames <- liveStreamFrame{instrumentID: target.instrumentID, event: ev}:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}
+}
+
+// writeStreamError 输出建流前的 V1 错误 envelope（非 200，EventSource 不会重连）。
+func writeStreamError(c *gin.Context, status int, apiErr *v1APIError) {
+	c.JSON(status, v1ErrorEnvelope{Error: *apiErr, RequestID: uuid.NewString()})
+}
+
 // handleV1Stream 创建生产用实时 K 线 SSE 处理器。
 func handleV1Stream(hub *live.Hub, cache *directory.Cache, fetch domain.Fetcher) gin.HandlerFunc {
 	return handleV1StreamWithDeps(liveStreamDeps{
@@ -62,49 +173,30 @@ func handleV1Stream(hub *live.Hub, cache *directory.Cache, fetch domain.Fetcher)
 }
 
 // handleV1StreamWithDeps 可注入依赖的实时流处理器。
-// 请求错误在建流前以 V1 错误 envelope 返回（非 200 时 EventSource 不再重连）；
-// 建流后上游故障与休市只通过 status 帧表达，连接保持。
+// 一个连接承载一组品种；周期与复权是连接参数，帧只带 instrumentId。
 func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Param("sourceId") != v1SourceID {
 			writeV1Error(c, http.StatusNotFound, v1CodeInvalidRequest, fmt.Sprintf("unknown sourceId %q", c.Param("sourceId")))
 			return
 		}
-		symbol := c.Query("symbol")
 		period := c.Query("period")
 		category, ok := v1PeriodToCategory[period]
 		if !ok {
 			writeV1Error(c, http.StatusBadRequest, v1CodeUnsupportedCapability, fmt.Sprintf("period %q is not supported", period))
 			return
 		}
-		target, apiErr, status := resolveLiveTarget(deps.cache, symbol, c.Query("instrumentId"), c.Query("exchange"))
+		ids, apiErr := parseLiveInstruments(c.Query("instruments"))
 		if apiErr != nil {
-			c.JSON(status, v1ErrorEnvelope{Error: *apiErr, RequestID: uuid.NewString()})
+			writeStreamError(c, http.StatusBadRequest, apiErr)
 			return
 		}
-		// 实时尾部的 qfq 与 none 数值一致（前复权以最新价为基准），默认 none；hfq 需显式指定。
-		adjustment := c.DefaultQuery("adjustment", "none")
-		if !v1AdjustmentSupported(string(target.Routing.Kind), adjustment) {
-			writeV1Error(c, http.StatusBadRequest, v1CodeUnsupportedCapability,
-				fmt.Sprintf("adjustment %q is not supported for kind %q", adjustment, target.Routing.Kind))
+		targets, apiErr, status := subscribeLiveTargets(deps, ids, period, category, c.DefaultQuery("adjustment", "none"))
+		if apiErr != nil {
+			writeStreamError(c, status, apiErr)
 			return
 		}
-		adjust := v1AdjustToUint[adjustment]
-		if adjustment == "qfq" {
-			adjust = v1AdjustToUint["none"]
-		}
-
-		// barAggregation 与 bars 接口一致：gotdx 只提供上游原生周期边界，不参与序列身份。
-		key := fmt.Sprintf("%s|%s|%d", target.ID(), period, adjust)
-		sub, err := deps.hub.Subscribe(key, live.Source{
-			Fetch:   deps.fetch(target, category, adjust),
-			Session: deps.session,
-		})
-		if err != nil {
-			writeV1Error(c, http.StatusServiceUnavailable, v1CodeUpstreamUnavailable, err.Error())
-			return
-		}
-		defer sub.Close()
+		defer closeLiveTargets(targets)
 
 		w := c.Writer
 		h := w.Header()
@@ -113,29 +205,38 @@ func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 		h.Set("Connection", "keep-alive")
 		h.Set("X-Accel-Buffering", "no")
 		w.WriteHeader(http.StatusOK)
+		connected := make([]string, len(targets))
+		for i, target := range targets {
+			connected[i] = target.instrumentID
+		}
 		// 首包立即下发，触发 EventSource onopen 并冲开代理缓冲。
-		if _, err := fmt.Fprintf(w, "retry: %d\n: connected %s\n\n", liveRetryMillis, target.ID()); err != nil {
+		if _, err := fmt.Fprintf(w, "retry: %d\n: connected %s\n\n", liveRetryMillis, strings.Join(connected, ",")); err != nil {
 			return
 		}
 		w.Flush()
 
+		ctx := c.Request.Context()
+		frames := make(chan liveStreamFrame)
+		lost := make(chan struct{}, 1)
+		for _, target := range targets {
+			go pumpLiveStream(ctx, target, frames, lost)
+		}
 		ticker := time.NewTicker(deps.heartbeat)
 		defer ticker.Stop()
-		ctx := c.Request.Context()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-sub.Lost():
-				// 慢消费者：断开让客户端重连并重新取快照
+			case <-lost:
+				// 慢消费者或上游丢失：断开让客户端重连并重新取快照
 				return
 			case <-ticker.C:
 				if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
 					return
 				}
 				w.Flush()
-			case ev := <-sub.Events():
-				if err := writeLiveFrame(w, symbol, period, ev); err != nil {
+			case frame := <-frames:
+				if err := writeLiveFrame(w, frame.instrumentID, frame.event); err != nil {
 					return
 				}
 				w.Flush()
@@ -145,8 +246,8 @@ func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 }
 
 // writeLiveFrame 把事件编码为一条无名 SSE data 消息。
-func writeLiveFrame(w io.Writer, symbol, period string, ev live.Event) error {
-	payload, err := encodeLiveFrame(symbol, period, ev)
+func writeLiveFrame(w io.Writer, instrumentID string, ev live.Event) error {
+	payload, err := encodeLiveFrame(instrumentID, ev)
 	if err != nil {
 		return err
 	}
@@ -154,8 +255,8 @@ func writeLiveFrame(w io.Writer, symbol, period string, ev live.Event) error {
 	return err
 }
 
-// encodeLiveFrame 按 KCQ LiveBarsFrame 编码 JSON；symbol/period 原样回显客户端请求值。
-func encodeLiveFrame(symbol, period string, ev live.Event) ([]byte, error) {
+// encodeLiveFrame 按 KCQ 实时帧协议编码 JSON；身份一律用 instrumentId。
+func encodeLiveFrame(instrumentID string, ev live.Event) ([]byte, error) {
 	switch ev.Type {
 	case live.EventSnapshot:
 		bars := ev.Bars
@@ -163,26 +264,23 @@ func encodeLiveFrame(symbol, period string, ev live.Event) ([]byte, error) {
 			bars = []live.Bar{}
 		}
 		return json.Marshal(struct {
-			Type   live.EventType `json:"type"`
-			Symbol string         `json:"symbol"`
-			Period string         `json:"period"`
-			Bars   []live.Bar     `json:"bars"`
-		}{ev.Type, symbol, period, bars})
+			Type         live.EventType `json:"type"`
+			InstrumentID string         `json:"instrumentId"`
+			Bars         []live.Bar     `json:"bars"`
+		}{ev.Type, instrumentID, bars})
 	case live.EventForming, live.EventClosed:
 		return json.Marshal(struct {
-			Type   live.EventType `json:"type"`
-			Symbol string         `json:"symbol"`
-			Period string         `json:"period"`
-			Bar    live.Bar       `json:"bar"`
-		}{ev.Type, symbol, period, ev.Bar})
+			Type         live.EventType `json:"type"`
+			InstrumentID string         `json:"instrumentId"`
+			Bar          live.Bar       `json:"bar"`
+		}{ev.Type, instrumentID, ev.Bar})
 	case live.EventStatus:
 		return json.Marshal(struct {
-			Type   live.EventType `json:"type"`
-			Symbol string         `json:"symbol"`
-			Period string         `json:"period"`
-			Status string         `json:"status"`
-			Detail string         `json:"detail,omitempty"`
-		}{ev.Type, symbol, period, ev.Status, ev.Detail})
+			Type         live.EventType `json:"type"`
+			InstrumentID string         `json:"instrumentId"`
+			Status       string         `json:"status"`
+			Detail       string         `json:"detail,omitempty"`
+		}{ev.Type, instrumentID, ev.Status, ev.Detail})
 	default:
 		return nil, fmt.Errorf("unknown live event type %q", ev.Type)
 	}

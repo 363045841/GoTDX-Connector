@@ -138,6 +138,7 @@ func RegisterRoutes(r *gin.Engine, deps Deps) {
 	{
 		group.GET("/sources/:sourceId/probe", handleV1Probe(deps.Status, deps.Probe))
 		group.GET("/sources/:sourceId/stream", handleV1Stream(deps.Hub, deps.Cache, deps.Fetch))
+		group.GET("/sources/:sourceId/quotes", handleV1Quotes(deps.Hub, deps.Cache, deps.Fetch))
 		group.POST("/instruments/search", handleV1Search(deps.Cache))
 		group.POST("/bars", handleV1Bars(deps.Fetch))
 		group.POST("/trading-calendar", handleV1TradingCalendar)

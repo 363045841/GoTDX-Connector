@@ -40,26 +40,26 @@ func TestEncodeLiveFrame(t *testing.T) {
 		want string
 	}{
 		{live.Event{Type: live.EventSnapshot, Bars: []live.Bar{b}},
-			`{"type":"snapshot","symbol":"600519","period":"5min","bars":[{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}]}`},
+			`{"type":"snapshot","instrumentId":"gotdx:stock:1:600519","bars":[{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}]}`},
 		{live.Event{Type: live.EventSnapshot},
-			`{"type":"snapshot","symbol":"600519","period":"5min","bars":[]}`},
+			`{"type":"snapshot","instrumentId":"gotdx:stock:1:600519","bars":[]}`},
 		{live.Event{Type: live.EventForming, Bar: b},
-			`{"type":"forming","symbol":"600519","period":"5min","bar":{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}}`},
+			`{"type":"forming","instrumentId":"gotdx:stock:1:600519","bar":{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}}`},
 		{live.Event{Type: live.EventClosed, Bar: b},
-			`{"type":"closed","symbol":"600519","period":"5min","bar":{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}}`},
+			`{"type":"closed","instrumentId":"gotdx:stock:1:600519","bar":{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}}`},
 		{live.Event{Type: live.EventStatus, Status: live.StatusMarketClosed, Detail: "weekend"},
-			`{"type":"status","symbol":"600519","period":"5min","status":"market-closed","detail":"weekend"}`},
+			`{"type":"status","instrumentId":"gotdx:stock:1:600519","status":"market-closed","detail":"weekend"}`},
 		{live.Event{Type: live.EventStatus, Status: live.StatusLive},
-			`{"type":"status","symbol":"600519","period":"5min","status":"live"}`},
+			`{"type":"status","instrumentId":"gotdx:stock:1:600519","status":"live"}`},
 	}
 	for _, tc := range cases {
-		got, err := encodeLiveFrame("600519", "5min", tc.ev)
+		got, err := encodeLiveFrame("gotdx:stock:1:600519", tc.ev)
 		if err != nil || string(got) != tc.want {
 			t.Fatalf("encode %v = %s (%v), want %s", tc.ev.Type, got, err, tc.want)
 		}
 	}
 	var sb strings.Builder
-	if err := writeLiveFrame(&sb, "600519", "5min", cases[5].ev); err != nil || sb.String() != "data: "+cases[5].want+"\n\n" {
+	if err := writeLiveFrame(&sb, "gotdx:stock:1:600519", cases[5].ev); err != nil || sb.String() != "data: "+cases[5].want+"\n\n" {
 		t.Fatalf("sse message = %q, want unnamed data line terminated by blank line", sb.String())
 	}
 }
@@ -143,11 +143,13 @@ func newLiveTestServer(t *testing.T, fetch *liveFakeFetch, heartbeat time.Durati
 		MaxSubscriptions: 4, MaxSeries: 4, SnapshotSize: 2, BufferSize: 16,
 	})
 	router := gin.New()
-	router.GET("/api/v1/market-data/sources/:sourceId/stream", handleV1StreamWithDeps(liveStreamDeps{
+	deps := liveStreamDeps{
 		hub: hub, cache: liveTestCache(), fetch: fetch.build,
 		session:   func(time.Time, []live.Bar) (bool, string) { return true, "" },
 		heartbeat: heartbeat,
-	}))
+	}
+	router.GET("/api/v1/market-data/sources/:sourceId/stream", handleV1StreamWithDeps(deps))
+	router.GET("/api/v1/market-data/sources/:sourceId/quotes", handleV1QuotesWithDeps(deps))
 	srv := httptest.NewServer(router)
 	t.Cleanup(srv.Close)
 	return srv, hub
@@ -228,7 +230,7 @@ func TestV1StreamEndToEnd(t *testing.T) {
 	fetch.set(live.Bar{Timestamp: 1000, Close: 10}, live.Bar{Timestamp: 2000, Close: 11}, live.Bar{Timestamp: 3000, Close: 12})
 	srv, hub := newLiveTestServer(t, fetch, 30*time.Millisecond)
 
-	resp, reader, cancel := openStream(t, srv, "symbol=600519&period=5min&barAggregation=original")
+	resp, reader, cancel := openStream(t, srv, "instruments=gotdx:stock:1:600519&period=5min&barAggregation=original")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
@@ -245,7 +247,7 @@ func TestV1StreamEndToEnd(t *testing.T) {
 
 	snap := reader.nextData(t)
 	bars, _ := snap["bars"].([]any)
-	if snap["type"] != "snapshot" || snap["symbol"] != "600519" || snap["period"] != "5min" || len(bars) != 2 {
+	if snap["type"] != "snapshot" || snap["instrumentId"] != "gotdx:stock:1:600519" || len(bars) != 2 {
 		t.Fatalf("snapshot = %#v, want 2 tail bars echoing symbol/period", snap)
 	}
 	if st := reader.nextData(t); st["type"] != "status" || st["status"] != "live" {
@@ -275,21 +277,21 @@ func TestV1StreamEndToEnd(t *testing.T) {
 	waitHubEmpty(t, hub)
 }
 
-// 验证同一品种以不同写法（代码/带后缀）连接时共享一个轮询器，且各自回显自己的 symbol。
+// 验证同一品种的重复 ID 在一个连接内只订阅一次，多个连接共享同一轮询器。
 func TestV1StreamSharesSeriesAcrossConnections(t *testing.T) {
 	fetch := &liveFakeFetch{}
 	fetch.set(live.Bar{Timestamp: 1000, Close: 10})
 	srv, hub := newLiveTestServer(t, fetch, time.Hour)
 
-	_, a, cancelA := openStream(t, srv, "symbol=600519&period=daily")
-	_, b, cancelB := openStream(t, srv, "symbol=600519.SH&period=daily")
+	_, a, cancelA := openStream(t, srv, "instruments=gotdx:stock:1:600519,gotdx:stock:1:600519&period=daily")
+	_, b, cancelB := openStream(t, srv, "instruments=gotdx:stock:1:600519&period=daily")
 	a.next(t)
 	b.next(t)
-	if snap := a.nextData(t); snap["symbol"] != "600519" {
+	if snap := a.nextData(t); snap["instrumentId"] != "gotdx:stock:1:600519" {
 		t.Fatalf("a snapshot = %#v", snap)
 	}
-	if snap := b.nextData(t); snap["symbol"] != "600519.SH" {
-		t.Fatalf("b snapshot = %#v, want own symbol echoed", snap)
+	if snap := b.nextData(t); snap["instrumentId"] != "gotdx:stock:1:600519" {
+		t.Fatalf("b snapshot = %#v", snap)
 	}
 	if series, subs := hub.Stats(); series != 1 || subs != 2 {
 		t.Fatalf("stats = %d/%d, want 1 shared series 2 subs", series, subs)
@@ -307,10 +309,11 @@ func TestV1StreamRejectsBadRequests(t *testing.T) {
 		code  int
 		want  string
 	}{
-		{"symbol=600519&period=2min", http.StatusBadRequest, v1CodeUnsupportedCapability},
-		{"symbol=000001&period=5min", http.StatusBadRequest, `"candidates":["gotdx:stock:0:000001","gotdx:index:1:000001"]`},
-		{"symbol=999999&period=5min", http.StatusNotFound, v1CodeInstrumentNotFound},
-		{"symbol=000001&period=5min&instrumentId=gotdx:index:1:000001&adjustment=qfq", http.StatusBadRequest, v1CodeUnsupportedCapability},
+		{"instruments=gotdx:stock:1:600519&period=2min", http.StatusBadRequest, v1CodeUnsupportedCapability},
+		{"instruments=gotdx:stock:1:600519,gotdx:nope:9:600519&period=5min", http.StatusBadRequest, v1CodeInvalidRequest},
+		{"instruments=&period=5min", http.StatusBadRequest, v1CodeInvalidRequest},
+		{"instruments=gotdx:stock:1:999999&period=5min", http.StatusBadRequest, v1CodeInvalidRequest},
+		{"instruments=gotdx:index:1:000001&period=5min&adjustment=qfq", http.StatusBadRequest, v1CodeUnsupportedCapability},
 	}
 	for _, tc := range cases {
 		resp, err := http.Get(srv.URL + "/api/v1/market-data/sources/gotdx/stream?" + tc.query)
@@ -324,7 +327,7 @@ func TestV1StreamRejectsBadRequests(t *testing.T) {
 			t.Fatalf("%s → %d %s, want %d containing %s", tc.query, resp.StatusCode, body.String(), tc.code, tc.want)
 		}
 	}
-	resp, _ := http.Get(srv.URL + "/api/v1/market-data/sources/other/stream?symbol=600519&period=5min")
+	resp, _ := http.Get(srv.URL + "/api/v1/market-data/sources/other/stream?instruments=gotdx:stock:1:600519&period=5min")
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("unknown source status = %d, want 404", resp.StatusCode)
@@ -425,4 +428,62 @@ func TestV1CapabilitiesDeclareLiveBars(t *testing.T) {
 	if caps := v1InstrumentCapabilitiesFor(domain.KindEx); caps.LiveBars == nil || *caps.LiveBars {
 		t.Fatalf("ex caps = %#v, want explicit liveBars false", caps)
 	}
+}
+
+// openQuotes 发起报价 SSE 请求并返回读取器与取消函数。
+func openQuotes(t *testing.T, srv *httptest.Server, query string) (sseReader, context.CancelFunc) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/api/v1/market-data/sources/gotdx/quotes?"+query, nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { resp.Body.Close() })
+	return sseReader{bufio.NewReader(resp.Body)}, cancel
+}
+
+// 验证一条连接承载多个品种：每个品种各自下发快照，帧身份用 instrumentId。
+func TestV1StreamCarriesMultipleInstruments(t *testing.T) {
+	fetch := &liveFakeFetch{}
+	fetch.set(live.Bar{Timestamp: 1000, Close: 10}, live.Bar{Timestamp: 2000, Close: 11})
+	srv, hub := newLiveTestServer(t, fetch, time.Hour)
+
+	_, reader, cancel := openStream(t, srv, "instruments=gotdx:stock:1:600519,gotdx:stock:0:000001&period=daily")
+	reader.next(t) // retry + connected 注释
+	seen := map[string]bool{}
+	for len(seen) < 2 {
+		frame := reader.nextData(t)
+		if frame["type"] == "snapshot" {
+			seen[frame["instrumentId"].(string)] = true
+		}
+	}
+	if !seen["gotdx:stock:1:600519"] || !seen["gotdx:stock:0:000001"] {
+		t.Fatalf("snapshots = %v, want both instruments", seen)
+	}
+	if series, subs := hub.Stats(); series != 2 || subs != 2 {
+		t.Fatalf("stats = %d/%d, want 2 series on 1 connection", series, subs)
+	}
+	cancel()
+	waitHubEmpty(t, hub)
+}
+
+// 验证报价是日线尾部投影：最新价与昨收来自同一帧流，不新增上游查询。
+func TestV1QuotesProjectLastAndPreviousClose(t *testing.T) {
+	fetch := &liveFakeFetch{}
+	fetch.set(live.Bar{Timestamp: 1000, Close: 10}, live.Bar{Timestamp: 2000, Close: 11})
+	srv, hub := newLiveTestServer(t, fetch, time.Hour)
+
+	reader, cancel := openQuotes(t, srv, "instruments=gotdx:stock:1:600519")
+	reader.next(t) // retry + connected 注释
+	frame := reader.nextData(t)
+	if frame["type"] != "quote" || frame["instrumentId"] != "gotdx:stock:1:600519" {
+		t.Fatalf("quote = %#v, want instrumentId identity", frame)
+	}
+	if frame["last"] != float64(11) || frame["prevClose"] != float64(10) {
+		t.Fatalf("quote = %#v, want last=11 prevClose=10", frame)
+	}
+	cancel()
+	waitHubEmpty(t, hub)
 }
