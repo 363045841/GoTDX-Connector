@@ -34,6 +34,10 @@ func corsMiddleware() gin.HandlerFunc {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		c.Header("Access-Control-Allow-Headers", "Content-Type, X-Request-Id")
+		// Chrome 对公开页面访问本机的请求会先发 PNA 预检，缺少该头会被拦截。
+		if c.GetHeader("Access-Control-Request-Private-Network") == "true" {
+			c.Header("Access-Control-Allow-Private-Network", "true")
+		}
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
