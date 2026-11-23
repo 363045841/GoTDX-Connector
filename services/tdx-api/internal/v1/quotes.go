@@ -5,9 +5,7 @@ package v1
 import (
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
-	"strings"
 	"time"
 
 	"KlineChartQuantGo/services/tdx-api/internal/directory"
@@ -40,7 +38,7 @@ func newQuoteProjection() *quoteProjection {
 }
 
 // push 送入一帧；产生新的报价才返回载荷。
-func (p *quoteProjection) push(instrumentID string, ev live.Event) ([]byte, bool) {
+func (p *quoteProjection) push(instrumentID string, ev live.Event, seq *int64) ([]byte, bool) {
 	switch ev.Type {
 	case live.EventSnapshot:
 		p.bars[instrumentID] = tailBars(ev.Bars, quoteBarLimit)
@@ -49,7 +47,7 @@ func (p *quoteProjection) push(instrumentID string, ev live.Event) ([]byte, bool
 	default:
 		return nil, false
 	}
-	return p.quote(instrumentID)
+	return p.quote(instrumentID, seq)
 }
 
 // upsert 按时间戳升序插入或覆盖，只保留尾部窗口。
@@ -72,7 +70,7 @@ func (p *quoteProjection) upsert(instrumentID string, bar live.Bar) {
 }
 
 // quote 倒数两根即最新价与昨收；不足两根时没有可比基准。
-func (p *quoteProjection) quote(instrumentID string) ([]byte, bool) {
+func (p *quoteProjection) quote(instrumentID string, seq *int64) ([]byte, bool) {
 	bars := p.bars[instrumentID]
 	if len(bars) < 2 {
 		return nil, false
@@ -84,12 +82,26 @@ func (p *quoteProjection) quote(instrumentID string) ([]byte, bool) {
 	}
 	p.emitted[instrumentID] = marker
 	payload, err := json.Marshal(struct {
-		Type         string  `json:"type"`
-		InstrumentID string  `json:"instrumentId"`
-		Last         float64 `json:"last"`
-		PrevClose    float64 `json:"prevClose"`
-		Timestamp    int64   `json:"timestamp"`
-	}{"quote", instrumentID, last.Close, previous.Close, last.Timestamp})
+		Type         string `json:"type"`
+		Seq          int64  `json:"seq"`
+		Ts           int64  `json:"ts"`
+		InstrumentID string `json:"instrumentId"`
+		Quote        struct {
+			Last      float64 `json:"last"`
+			PrevClose float64 `json:"prevClose"`
+			Timestamp int64   `json:"timestamp"`
+		} `json:"quote"`
+	}{
+		Type:         "quote",
+		Seq:          nextSeq(seq),
+		Ts:           time.Now().UnixMilli(),
+		InstrumentID: instrumentID,
+		Quote: struct {
+			Last      float64 `json:"last"`
+			PrevClose float64 `json:"prevClose"`
+			Timestamp int64   `json:"timestamp"`
+		}{last.Close, previous.Close, last.Timestamp},
+	})
 	if err != nil {
 		return nil, false
 	}
@@ -147,7 +159,8 @@ func handleV1QuotesWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 		for i, target := range targets {
 			connected[i] = target.instrumentID
 		}
-		if _, err := fmt.Fprintf(w, "retry: %d\n: connected %s\n\n", liveRetryMillis, strings.Join(connected, ",")); err != nil {
+		var seq int64
+		if err := writeHello(w, &seq, connected, quotePeriod, "none"); err != nil {
 			return
 		}
 		w.Flush()
@@ -168,12 +181,12 @@ func handleV1QuotesWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 			case <-lost:
 				return
 			case <-ticker.C:
-				if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				if err := writePing(w, &seq); err != nil {
 					return
 				}
 				w.Flush()
 			case frame := <-frames:
-				payload, ok := projection.push(frame.instrumentID, frame.event)
+				payload, ok := projection.push(frame.instrumentID, frame.event, &seq)
 				if !ok {
 					continue
 				}

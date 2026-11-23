@@ -46,6 +46,7 @@ go build -o tdx-api.exe ./services/tdx-api
 |---|---|---|
 | GET | `/api/v1/market-data/sources/:sourceId/probe` | 数据源探测（状态 + 源级能力声明） |
 | GET | `/api/v1/market-data/sources/gotdx/stream` | 实时 K 线 SSE（A 股/指数，见下） |
+| GET | `/api/v1/market-data/sources/gotdx/quotes` | 实时报价 SSE（`?instruments=`，见下） |
 | POST | `/api/v1/market-data/instruments/search` | 品种目录搜索 |
 | POST | `/api/v1/market-data/bars` | K 线（UTC 毫秒区间） |
 | POST | `/api/v1/market-data/timeshare` | 分时（交易日 YYYY-MM-DD） |
@@ -55,12 +56,13 @@ go build -o tdx-api.exe ./services/tdx-api
 
 `GET /api/v1/market-data/sources/gotdx/stream?symbol=600519&period=5min&barAggregation=original`
 
-- 响应 `text/event-stream`，每条消息是一行无名 `data: <json>`，帧格式与 KCQ `BarsLiveSource` 一致：
-  `{type:'snapshot',symbol,period,bars}`（最近 2 根）→ `{type:'forming',symbol,period,bar}`（当前根变化时）→
-  `{type:'closed',symbol,period,bar}`（收线终值，紧跟新一根的 forming）；`{type:'status',symbol,period,status,detail?}`
-  取值 `live` / `market-closed` / `upstream-error` / `no-data`。`symbol`/`period` 原样回显请求值。
+- 响应 `text/event-stream`，每条消息是一行无名 `data: <json>`；所有帧共用信封 `{type, seq, ts}`，`seq` 是连接级单调序号，`ts` 是服务端毫秒时间。
+- 首帧 `hello` 回显订阅身份与快照条数：`{type:'hello',instruments,period,adjustment,snapshotSize}`。
+- 行情帧：`{type:'snapshot',instrumentId,bars}`（尾部 `snapshotSize` 根）→ `{type:'bar',instrumentId,state:'forming'|'closed',bar}`
+  （`closed` 是收线终值，紧跟新一根的 `forming`）；`{type:'status',instrumentId,status,detail?}` 取值 `live` / `market-closed` / `upstream-error` / `no-data`。
+  报价通道下行 `{type:'quote',instrumentId,quote:{last,prevClose,timestamp}}`，涨跌幅由消费端按昨收派生。
 - `bar` 为 `{timestamp(UTC ms),open,high,low,close,volume?,turnover?}`，与 `/bars` 同一映射。
-- `: ping` 心跳每 15 秒一次；首包带 `retry: 3000`。
+- `{type:'ping'}` 每 15 秒一次；不再下发 `retry:` 建议，重连节奏由客户端决定。
 - 品种解析：`instrumentId=gotdx:{stock|index}:{market}:{code}`（推荐）、`symbol=600519.SH`、`exchange=SH`，
   或仅凭代码在证券目录中唯一匹配；同码跨市场（如 `000001` 平安银行/上证指数）返回 400 并列出候选。
   指数必须与所属市场一致（上证 `000xxx` → market 1，深证 `399xxx` → market 0，北证 `899xxx` → market 2）。

@@ -25,11 +25,11 @@ import (
 // liveFetchSize 每次轮询拉取的尾部根数：比快照多一根，用于确认上一根的收线终值。
 const liveFetchSize = 3
 
-// liveHeartbeatInterval SSE 心跳注释间隔，防止代理与浏览器判定空闲断开。
-const liveHeartbeatInterval = 15 * time.Second
+// liveSnapshotSize 新连接下发的尾部快照根数。
+const liveSnapshotSize = 2
 
-// liveRetryMillis 建议 EventSource 断线后的重连等待。
-const liveRetryMillis = 3000
+// liveHeartbeatInterval 心跳帧间隔：数据帧而非注释，前端据此判断存活。
+const liveHeartbeatInterval = 15 * time.Second
 
 // liveSeries 实时订阅的上游查询身份；路由由统一解析器给出。
 type liveSeries struct {
@@ -209,8 +209,9 @@ func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 		for i, target := range targets {
 			connected[i] = target.instrumentID
 		}
-		// 首包立即下发，触发 EventSource onopen 并冲开代理缓冲。
-		if _, err := fmt.Fprintf(w, "retry: %d\n: connected %s\n\n", liveRetryMillis, strings.Join(connected, ",")); err != nil {
+		// 首帧回显订阅身份：客户端据此确认服务端理解的订阅，并知道快照策略。
+		var seq int64
+		if err := writeHello(w, &seq, connected, period, c.DefaultQuery("adjustment", "none")); err != nil {
 			return
 		}
 		w.Flush()
@@ -231,12 +232,12 @@ func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 				// 慢消费者或上游丢失：断开让客户端重连并重新取快照
 				return
 			case <-ticker.C:
-				if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
+				if err := writePing(w, &seq); err != nil {
 					return
 				}
 				w.Flush()
 			case frame := <-frames:
-				if err := writeLiveFrame(w, frame.instrumentID, frame.event); err != nil {
+				if err := writeLiveFrame(w, &seq, frame.instrumentID, frame.event); err != nil {
 					return
 				}
 				w.Flush()
@@ -245,9 +246,17 @@ func handleV1StreamWithDeps(deps liveStreamDeps) gin.HandlerFunc {
 	}
 }
 
-// writeLiveFrame 把事件编码为一条无名 SSE data 消息。
-func writeLiveFrame(w io.Writer, instrumentID string, ev live.Event) error {
-	payload, err := encodeLiveFrame(instrumentID, ev)
+// writeHello 回显订阅身份与快照条数；这是连接级帧，不带品种身份。
+func writeHello(w io.Writer, seq *int64, instruments []string, period, adjustment string) error {
+	payload, err := json.Marshal(struct {
+		Type         string   `json:"type"`
+		Seq          int64    `json:"seq"`
+		Ts           int64    `json:"ts"`
+		Instruments  []string `json:"instruments"`
+		SnapshotSize int      `json:"snapshotSize"`
+		Period       string   `json:"period"`
+		Adjustment   string   `json:"adjustment"`
+	}{"hello", nextSeq(seq), time.Now().UnixMilli(), instruments, liveSnapshotSize, period, adjustment})
 	if err != nil {
 		return err
 	}
@@ -255,8 +264,39 @@ func writeLiveFrame(w io.Writer, instrumentID string, ev live.Event) error {
 	return err
 }
 
-// encodeLiveFrame 按 KCQ 实时帧协议编码 JSON；身份一律用 instrumentId。
-func encodeLiveFrame(instrumentID string, ev live.Event) ([]byte, error) {
+// writePing 写连接级心跳帧；注释行无法被浏览器 JS 观察，不能用于存活判断。
+func writePing(w io.Writer, seq *int64) error {
+	payload, err := json.Marshal(struct {
+		Type string `json:"type"`
+		Seq  int64  `json:"seq"`
+		Ts   int64  `json:"ts"`
+	}{"ping", nextSeq(seq), time.Now().UnixMilli()})
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", payload)
+	return err
+}
+
+// nextSeq 递增连接级单调序号。
+func nextSeq(seq *int64) int64 {
+	current := *seq
+	*seq = current + 1
+	return current
+}
+
+// writeLiveFrame 把事件编码为一条无名 SSE data 消息。
+func writeLiveFrame(w io.Writer, seq *int64, instrumentID string, ev live.Event) error {
+	payload, err := encodeLiveFrame(instrumentID, ev, nextSeq(seq))
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Fprintf(w, "data: %s\n\n", payload)
+	return err
+}
+
+// encodeLiveFrame 按 KCQ V1.1 流协议编码 JSON；身份一律用 instrumentId，增量帧带状态。
+func encodeLiveFrame(instrumentID string, ev live.Event, seq int64) ([]byte, error) {
 	switch ev.Type {
 	case live.EventSnapshot:
 		bars := ev.Bars
@@ -265,22 +305,29 @@ func encodeLiveFrame(instrumentID string, ev live.Event) ([]byte, error) {
 		}
 		return json.Marshal(struct {
 			Type         live.EventType `json:"type"`
+			Seq          int64          `json:"seq"`
+			Ts           int64          `json:"ts"`
 			InstrumentID string         `json:"instrumentId"`
 			Bars         []live.Bar     `json:"bars"`
-		}{ev.Type, instrumentID, bars})
+		}{ev.Type, seq, time.Now().UnixMilli(), instrumentID, bars})
 	case live.EventForming, live.EventClosed:
 		return json.Marshal(struct {
 			Type         live.EventType `json:"type"`
+			Seq          int64          `json:"seq"`
+			Ts           int64          `json:"ts"`
 			InstrumentID string         `json:"instrumentId"`
+			State        string         `json:"state"`
 			Bar          live.Bar       `json:"bar"`
-		}{ev.Type, instrumentID, ev.Bar})
+		}{"bar", seq, time.Now().UnixMilli(), instrumentID, string(ev.Type), ev.Bar})
 	case live.EventStatus:
 		return json.Marshal(struct {
 			Type         live.EventType `json:"type"`
+			Seq          int64          `json:"seq"`
+			Ts           int64          `json:"ts"`
 			InstrumentID string         `json:"instrumentId"`
 			Status       string         `json:"status"`
 			Detail       string         `json:"detail,omitempty"`
-		}{ev.Type, instrumentID, ev.Status, ev.Detail})
+		}{ev.Type, seq, time.Now().UnixMilli(), instrumentID, ev.Status, ev.Detail})
 	default:
 		return nil, fmt.Errorf("unknown live event type %q", ev.Type)
 	}

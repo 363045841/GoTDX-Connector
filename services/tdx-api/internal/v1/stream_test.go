@@ -32,35 +32,80 @@ func liveTestCache() *directory.Cache {
 // floatPtr 返回数值指针。
 func floatPtr(v float64) *float64 { return &v }
 
-// 验证四类帧按 KCQ LiveBarsFrame 编码，并原样回显客户端的 symbol/period。
+// 验证帧编码：统一信封带 seq/ts，增量帧用 bar + state，身份一律 instrumentId。
 func TestEncodeLiveFrame(t *testing.T) {
 	b := live.Bar{Timestamp: 1700000000000, Open: 1, High: 2, Low: 0.5, Close: 1.5, Volume: floatPtr(10), TradingDay: 20231114}
 	cases := []struct {
-		ev   live.Event
-		want string
+		ev    live.Event
+		check func(t *testing.T, frame map[string]any)
 	}{
-		{live.Event{Type: live.EventSnapshot, Bars: []live.Bar{b}},
-			`{"type":"snapshot","instrumentId":"gotdx:stock:1:600519","bars":[{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}]}`},
-		{live.Event{Type: live.EventSnapshot},
-			`{"type":"snapshot","instrumentId":"gotdx:stock:1:600519","bars":[]}`},
-		{live.Event{Type: live.EventForming, Bar: b},
-			`{"type":"forming","instrumentId":"gotdx:stock:1:600519","bar":{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}}`},
-		{live.Event{Type: live.EventClosed, Bar: b},
-			`{"type":"closed","instrumentId":"gotdx:stock:1:600519","bar":{"timestamp":1700000000000,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10}}`},
-		{live.Event{Type: live.EventStatus, Status: live.StatusMarketClosed, Detail: "weekend"},
-			`{"type":"status","instrumentId":"gotdx:stock:1:600519","status":"market-closed","detail":"weekend"}`},
-		{live.Event{Type: live.EventStatus, Status: live.StatusLive},
-			`{"type":"status","instrumentId":"gotdx:stock:1:600519","status":"live"}`},
+		{
+			live.Event{Type: live.EventSnapshot, Bars: []live.Bar{b}},
+			func(t *testing.T, frame map[string]any) {
+				bars := frame["bars"].([]any)
+				if frame["type"] != "snapshot" || len(bars) != 1 || frame["instrumentId"] != "gotdx:stock:1:600519" {
+					t.Fatalf("snapshot = %#v", frame)
+				}
+			},
+		},
+		{
+			live.Event{Type: live.EventSnapshot},
+			func(t *testing.T, frame map[string]any) {
+				if bars := frame["bars"].([]any); len(bars) != 0 {
+					t.Fatalf("empty snapshot = %#v", frame)
+				}
+			},
+		},
+		{
+			live.Event{Type: live.EventForming, Bar: b},
+			func(t *testing.T, frame map[string]any) {
+				if frame["type"] != "bar" || frame["state"] != "forming" {
+					t.Fatalf("forming = %#v", frame)
+				}
+			},
+		},
+		{
+			live.Event{Type: live.EventClosed, Bar: b},
+			func(t *testing.T, frame map[string]any) {
+				if frame["type"] != "bar" || frame["state"] != "closed" {
+					t.Fatalf("closed = %#v", frame)
+				}
+			},
+		},
+		{
+			live.Event{Type: live.EventStatus, Status: live.StatusMarketClosed, Detail: "weekend"},
+			func(t *testing.T, frame map[string]any) {
+				if frame["type"] != "status" || frame["status"] != "market-closed" || frame["detail"] != "weekend" {
+					t.Fatalf("status = %#v", frame)
+				}
+			},
+		},
+		{
+			live.Event{Type: live.EventStatus, Status: live.StatusLive},
+			func(t *testing.T, frame map[string]any) {
+				if frame["status"] != "live" {
+					t.Fatalf("live status = %#v", frame)
+				}
+			},
+		},
 	}
 	for _, tc := range cases {
-		got, err := encodeLiveFrame("gotdx:stock:1:600519", tc.ev)
-		if err != nil || string(got) != tc.want {
-			t.Fatalf("encode %v = %s (%v), want %s", tc.ev.Type, got, err, tc.want)
+		got, err := encodeLiveFrame("gotdx:stock:1:600519", tc.ev, 7)
+		if err != nil {
+			t.Fatalf("encode %v: %v", tc.ev.Type, err)
 		}
+		var frame map[string]any
+		if err := json.Unmarshal(got, &frame); err != nil {
+			t.Fatalf("decode %v: %v", tc.ev.Type, err)
+		}
+		if frame["seq"] != float64(7) || frame["ts"] == nil {
+			t.Fatalf("envelope = %#v, want seq 7 and ts", frame)
+		}
+		tc.check(t, frame)
 	}
 	var sb strings.Builder
-	if err := writeLiveFrame(&sb, "gotdx:stock:1:600519", cases[5].ev); err != nil || sb.String() != "data: "+cases[5].want+"\n\n" {
-		t.Fatalf("sse message = %q, want unnamed data line terminated by blank line", sb.String())
+	if err := writeLiveFrame(&sb, new(int64), "gotdx:stock:1:600519", cases[5].ev); err != nil || !strings.HasPrefix(sb.String(), "data: ") {
+		t.Fatalf("sse message = %q, want unnamed data line", sb.String())
 	}
 }
 
@@ -241,8 +286,9 @@ func TestV1StreamEndToEnd(t *testing.T) {
 			t.Fatalf("%s = %q, want %q", header, got, want)
 		}
 	}
-	if first := reader.next(t); !strings.HasPrefix(first, "retry: ") || !strings.Contains(first, ": connected gotdx:stock:1:600519") {
-		t.Fatalf("first message = %q, want retry + connected comment", first)
+	first := reader.nextData(t)
+	if first["type"] != "hello" || first["snapshotSize"] != float64(liveSnapshotSize) {
+		t.Fatalf("hello = %#v, want subscription echo", first)
 	}
 
 	snap := reader.nextData(t)
@@ -255,19 +301,19 @@ func TestV1StreamEndToEnd(t *testing.T) {
 	}
 
 	fetch.set(live.Bar{Timestamp: 2000, Close: 11}, live.Bar{Timestamp: 3000, Close: 12.5})
-	if f := reader.nextData(t); f["type"] != "forming" || f["bar"].(map[string]any)["close"] != 12.5 {
+	if f := reader.nextData(t); f["type"] != "bar" || f["state"] != "forming" || f["bar"].(map[string]any)["close"] != 12.5 {
 		t.Fatalf("forming = %#v, want close 12.5", f)
 	}
 	fetch.set(live.Bar{Timestamp: 3000, Close: 12.8}, live.Bar{Timestamp: 4000, Close: 13})
 	closed, forming := reader.nextData(t), reader.nextData(t)
-	if closed["type"] != "closed" || closed["bar"].(map[string]any)["timestamp"] != float64(3000) || closed["bar"].(map[string]any)["close"] != 12.8 {
+	if closed["type"] != "bar" || closed["state"] != "closed" || closed["bar"].(map[string]any)["timestamp"] != float64(3000) || closed["bar"].(map[string]any)["close"] != 12.8 {
 		t.Fatalf("closed = %#v, want final ts=3000 close=12.8", closed)
 	}
-	if forming["type"] != "forming" || forming["bar"].(map[string]any)["timestamp"] != float64(4000) {
+	if forming["type"] != "bar" || forming["state"] != "forming" || forming["bar"].(map[string]any)["timestamp"] != float64(4000) {
 		t.Fatalf("forming = %#v, want ts=4000", forming)
 	}
-	if msg := reader.next(t); msg != ": ping" {
-		t.Fatalf("idle message = %q, want heartbeat", msg)
+	if ping := reader.nextData(t); ping["type"] != "ping" {
+		t.Fatalf("idle frame = %#v, want heartbeat", ping)
 	}
 
 	if series, subs := hub.Stats(); series != 1 || subs != 1 {
@@ -285,8 +331,8 @@ func TestV1StreamSharesSeriesAcrossConnections(t *testing.T) {
 
 	_, a, cancelA := openStream(t, srv, "instruments=gotdx:stock:1:600519,gotdx:stock:1:600519&period=daily")
 	_, b, cancelB := openStream(t, srv, "instruments=gotdx:stock:1:600519&period=daily")
-	a.next(t)
-	b.next(t)
+	a.nextData(t) // hello
+	b.nextData(t) // hello
 	if snap := a.nextData(t); snap["instrumentId"] != "gotdx:stock:1:600519" {
 		t.Fatalf("a snapshot = %#v", snap)
 	}
@@ -451,7 +497,7 @@ func TestV1StreamCarriesMultipleInstruments(t *testing.T) {
 	srv, hub := newLiveTestServer(t, fetch, time.Hour)
 
 	_, reader, cancel := openStream(t, srv, "instruments=gotdx:stock:1:600519,gotdx:stock:0:000001&period=daily")
-	reader.next(t) // retry + connected 注释
+	reader.nextData(t) // hello
 	seen := map[string]bool{}
 	for len(seen) < 2 {
 		frame := reader.nextData(t)
@@ -476,12 +522,13 @@ func TestV1QuotesProjectLastAndPreviousClose(t *testing.T) {
 	srv, hub := newLiveTestServer(t, fetch, time.Hour)
 
 	reader, cancel := openQuotes(t, srv, "instruments=gotdx:stock:1:600519")
-	reader.next(t) // retry + connected 注释
+	reader.nextData(t) // hello
 	frame := reader.nextData(t)
 	if frame["type"] != "quote" || frame["instrumentId"] != "gotdx:stock:1:600519" {
 		t.Fatalf("quote = %#v, want instrumentId identity", frame)
 	}
-	if frame["last"] != float64(11) || frame["prevClose"] != float64(10) {
+	quote, _ := frame["quote"].(map[string]any)
+	if quote["last"] != float64(11) || quote["prevClose"] != float64(10) {
 		t.Fatalf("quote = %#v, want last=11 prevClose=10", frame)
 	}
 	cancel()
